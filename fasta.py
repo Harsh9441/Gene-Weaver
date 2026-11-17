@@ -1,9 +1,10 @@
-"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.
+"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.
 
-  python fasta.py selftest                                   # all Day 1 + Day 2 tests
+  python fasta.py selftest                                   # all tests
   python fasta.py rules [--out BENCHMARK_RULES.md]           # Day 1: the benchmark rules
   python fasta.py setup --dir geneweaver_bench               # Day 1: project folders + rules + manifest
   python fasta.py mockgenome --scale 0.0005 --out-dir mock_genome --verify   # Day 2
+  python fasta.py inspect genome.fa [--guides g.fa] [--parser auto|bio|builtin] [--crosscheck]   # Day 3
 """
 from __future__ import annotations
 
@@ -639,9 +640,174 @@ def oracle_search(genome, guides, cfg, force_dp=False):
 
 
 # ======================================================================
+# DAY 3 - Biopython parsing: genomes and guides via Bio.SeqIO (built-in fallback), QC report, primary-assembly check.
+# ======================================================================
+import gzip, os, re
+
+try:                                    # Biopython is optional: pip install biopython
+    from Bio import SeqIO
+    HAVE_BIOPYTHON = True
+except ImportError:
+    SeqIO = None
+    HAVE_BIOPYTHON = False
+
+_EXT_FMT = {".fa": "fasta", ".fasta": "fasta", ".fna": "fasta", ".fas": "fasta",
+            ".fq": "fastq", ".fastq": "fastq", ".gb": "genbank", ".gbk": "genbank", ".genbank": "genbank"}
+# Rules s4.1: primary assembly only (no alt / random / decoy / unplaced contigs unless stated)
+_NONPRIMARY = re.compile(r"(_alt$|_random$|_decoy$|_fix$|^chrUn|^HLA-|^chrEBV$)", re.I)
+
+
+def detect_format(path):
+    p = path.lower()
+    if p.endswith(".gz"):
+        p = p[:-3]
+    ext = os.path.splitext(p)[1]
+    if ext not in _EXT_FMT:
+        raise ValueError(f"unknown sequence file type: {path} (use .fa/.fasta/.fna, .fastq, .gb/.gbk; .gz allowed)")
+    return _EXT_FMT[ext]
+
+
+def _open_text(path):
+    return gzip.open(path, "rt") if path.lower().endswith(".gz") else open(path)
+
+
+def _use_bio(parser):
+    if parser not in ("auto", "bio", "builtin"):
+        raise ValueError("parser must be auto, bio or builtin")
+    if parser == "bio" and not HAVE_BIOPYTHON:
+        raise RuntimeError("Biopython is not installed. Run: pip install biopython")
+    return HAVE_BIOPYTHON if parser == "auto" else parser == "bio"
+
+
+def _check_parser(fmt, use_bio):
+    if fmt != "fasta" and not use_bio:
+        raise ValueError(f"the built-in parser reads FASTA only; install Biopython to read {fmt} (pip install biopython)")
+
+
+def _iter_records(path, fmt, use_bio):
+    """Yield (id, raw_sequence). id = first whitespace-delimited token of the header, as Biopython does."""
+    if use_bio:
+        with _open_text(path) as fh:
+            for rec in SeqIO.parse(fh, fmt):
+                yield rec.id, str(rec.seq)
+        return
+    name, parts = None, []
+    with _open_text(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                if name is not None:
+                    yield name, "".join(parts)
+                head = line[1:].split()
+                name, parts = (head[0] if head else ""), []
+            elif line and name is not None:
+                parts.append(line)
+    if name is not None:
+        yield name, "".join(parts)
+
+
+def _clean(seq):
+    """Day 1 rule: soft-masked bases count as sequence (upper-cased); anything that is not ACGT becomes N."""
+    return re.sub("[^ACGT]", "N", seq.upper())
+
+
+def read_genome(path, parser="auto", fmt=None):
+    """Genome as {name: ACGTN string}. parser: auto (Biopython if installed), bio, or builtin."""
+    use_bio = _use_bio(parser)
+    fmt = fmt or detect_format(path)
+    _check_parser(fmt, use_bio)
+    genome = {}
+    for name, raw in _iter_records(path, fmt, use_bio):
+        if name in genome:
+            raise ValueError(f"duplicate sequence name {name!r} in {path}")
+        genome[name] = _clean(raw)
+    if not genome:
+        raise ValueError(f"no sequences found in {path}")
+    return genome
+
+
+def read_guides_any(path, parser="auto", length_range=(17, 25)):
+    """Guides from a FASTA file (via Biopython when available) or the Day 1 two-column TSV (id<TAB>spacer)."""
+    if path.lower().endswith((".tsv", ".txt", ".tab")):
+        raw = read_guides(path)
+    else:
+        use_bio = _use_bio(parser)
+        fmt = detect_format(path)
+        _check_parser(fmt, use_bio)
+        raw = list(_iter_records(path, fmt, use_bio))
+    out, seen = [], set()
+    lo, hi = length_range
+    for gid, seq in raw:
+        seq = seq.upper()
+        if gid in seen:
+            raise ValueError(f"duplicate guide id {gid!r}")
+        seen.add(gid)
+        bad = set(seq) - set(IUPAC)
+        if bad:
+            raise ValueError(f"guide {gid}: invalid characters {sorted(bad)}")
+        if not lo <= len(seq) <= hi:
+            raise ValueError(f"guide {gid}: length {len(seq)} is outside {lo}-{hi}")
+        out.append((gid, seq))
+    if not out:
+        raise ValueError(f"no guides found in {path}")
+    return out
+
+
+def flag_nonprimary(names):
+    return [n for n in names if _NONPRIMARY.search(n)]
+
+
+def genome_report(path, parser="auto", fmt=None):
+    """QC summary of a genome file; flags non-primary contigs (Rules s4.1) and records the SHA-256 (Rules s4.1)."""
+    use_bio = _use_bio(parser)
+    fmt = fmt or detect_format(path)
+    _check_parser(fmt, use_bio)
+    recs, seen = [], set()
+    total = nn = gc = acgt = low = 0
+    for name, raw in _iter_records(path, fmt, use_bio):
+        if name in seen:
+            raise ValueError(f"duplicate sequence name {name!r} in {path}")
+        seen.add(name)
+        clean = _clean(raw)
+        a, c, g, t = (clean.count(x) for x in "ACGT")
+        recs.append((name, len(raw)))
+        total += len(raw); nn += clean.count("N"); gc += c + g; acgt += a + c + g + t
+        low += sum(1 for ch in raw if ch.islower())
+    if not recs:
+        raise ValueError(f"no sequences found in {path}")
+    return dict(parser="biopython" if use_bio else "builtin", format=fmt, n_records=len(recs), total_bp=total,
+                n_fraction=round(nn / total, 4), masked_fraction=round(low / total, 4),
+                gc_percent=round(100 * gc / acgt, 2) if acgt else None, records=recs,
+                nonprimary=flag_nonprimary([r[0] for r in recs]), sha256=sha256(path))
+
+
+def format_report(rep, top=8):
+    L = [f"parser      : {rep['parser']} ({rep['format']})",
+         f"sequences   : {rep['n_records']}   total {rep['total_bp']:,} bp",
+         f"N fraction  : {rep['n_fraction']}   soft-masked: {rep['masked_fraction']}   GC: {rep['gc_percent']}%",
+         f"sha256      : {rep['sha256']}"]
+    for name, n in rep["records"][:top]:
+        L.append(f"  {name:<24}{n:>14,} bp")
+    if rep["n_records"] > top:
+        L.append(f"  ... and {rep['n_records'] - top} more")
+    if rep["nonprimary"]:
+        L.append(f"WARNING: {len(rep['nonprimary'])} non-primary contigs (alt/random/decoy/unplaced): "
+                 f"{', '.join(rep['nonprimary'][:4])}{' ...' if len(rep['nonprimary']) > 4 else ''}")
+        L.append("         Rules s4.1 says to use the primary assembly only unless stated.")
+    return "\n".join(L)
+
+
+def crosscheck(path):
+    """True/False if Biopython and the built-in parser agree on a FASTA file; None if Biopython is missing."""
+    if not HAVE_BIOPYTHON:
+        return None
+    return read_genome(path, "bio") == read_genome(path, "builtin")
+
+
+# ======================================================================
 # WEEK 1 TESTS AND COMMAND LINE (Day 1 rules/setup + Day 2 mock genome)
 # ======================================================================
-import argparse, sys, tempfile
+import argparse, gzip, sys, tempfile
 
 
 def _read(path):
@@ -756,6 +922,39 @@ def selftest():
     tiny = generate_mock(scale=0.0001, chroms=["chr21", "chr22"], n_guides=2, copies=3, max_mm=3, bulge_copies=2)
     r = verify_planted(tiny["genome"], tiny["guides"], tiny["truth"], oracle_search, dict(CONFIGS["C4"], mm=3))
     check(f"oracle search finds every planted site ({r['found']}/{r['planted']})", r["found"] == r["planted"])
+    print("Day 3 - Biopython parsing (built-in fallback always tested)")
+    with tempfile.TemporaryDirectory() as td:
+        fa = os.path.join(td, "g.fa")
+        _write(fa, ">chr1 test\nacgtNNRYACGT\n>chr2\nACGTACGT\n")
+        g = read_genome(fa, parser="builtin")
+        check("parse names, soft-mask upper-cased, IUPAC -> N", g == {"chr1": "ACGTNNNNACGT", "chr2": "ACGTACGT"})
+        gz = os.path.join(td, "g.fa.gz")
+        with gzip.open(gz, "wt") as fh:
+            fh.write(_read(fa))
+        check("gzip FASTA reads identically", read_genome(gz, parser="builtin") == g)
+        rep = genome_report(fa, parser="builtin")
+        check("QC report: length, N fraction, soft-masked fraction",
+              rep["total_bp"] == 20 and rep["n_records"] == 2 and rep["n_fraction"] == 0.2 and rep["masked_fraction"] == 0.2)
+        check("non-primary contigs are flagged",
+              flag_nonprimary(["chr1", "chr1_KI270706v1_random", "chrUn_KI270302v1", "chr6_GL000250v2_alt"]) ==
+              ["chr1_KI270706v1_random", "chrUn_KI270302v1", "chr6_GL000250v2_alt"])
+        gf = os.path.join(td, "guides.fa")
+        _write(gf, ">g1\nGACGTCTAGCATCGATCGAA\n>g2 note\nacgtacgtacgtacgtacgt\n")
+        check("guides FASTA: ids, upper-case, length checked",
+              read_guides_any(gf, parser="builtin") == [("g1", "GACGTCTAGCATCGATCGAA"), ("g2", "ACGTACGTACGTACGTACGT")])
+        _write(gf, ">g1\nACGT\n")
+        try:
+            read_guides_any(gf, parser="builtin"); bad = False
+        except ValueError:
+            bad = True
+        check("too-short guide is rejected", bad)
+    if HAVE_BIOPYTHON:
+        with tempfile.TemporaryDirectory() as td:
+            fa = os.path.join(td, "g.fa")
+            _write(fa, ">chr1 test\nacgtNNRYACGT\n>chr2\nACGTACGT\n")
+            check("Biopython and built-in parsers agree", crosscheck(fa) is True)
+    else:
+        print("  [skip] Biopython not installed (pip install biopython): cross-check skipped")
     print("SELFTEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -793,6 +992,11 @@ def main(argv=None):
     r.add_argument("--out", help="write the rules to this Markdown file instead of printing")
     s = sub.add_parser("setup", help="Day 1: create the project folders, rules document and manifest template")
     s.add_argument("--dir", default="geneweaver_bench")
+    i = sub.add_parser("inspect", help="Day 3: parse a genome (and guides) with Biopython and print a QC report")
+    i.add_argument("path", help="genome file: .fa/.fasta/.fna (.gz ok); .fastq/.gb need Biopython")
+    i.add_argument("--guides", help="guide FASTA or TSV to validate")
+    i.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+    i.add_argument("--crosscheck", action="store_true", help="check Biopython and the built-in parser agree")
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -804,6 +1008,24 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.command in ("selftest", "test"):
         return selftest()
+    if a.command == "inspect":
+        try:
+            print(format_report(genome_report(a.path, a.parser)))
+            rc = 0
+            if a.guides:
+                gs = read_guides_any(a.guides, a.parser)
+                print(f"guides      : {len(gs)} read from {a.guides}, lengths {sorted({len(s) for _, s in gs})}")
+            if a.crosscheck:
+                same = crosscheck(a.path)
+                if same is None:
+                    print("crosscheck  : skipped (Biopython is not installed: pip install biopython)")
+                else:
+                    print("crosscheck  : Biopython and the built-in parser agree" if same else "crosscheck  : PARSERS DISAGREE")
+                    rc = 0 if same else 1
+            return rc
+        except (ValueError, RuntimeError, OSError) as e:
+            print("ERROR:", e)
+            return 2
     if a.command == "rules":
         if a.out:
             _write(a.out, rules_markdown())
