@@ -1,10 +1,11 @@
-"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.
+"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.  Day 4: chunking with border overlap.
 
   python fasta.py selftest                                   # all tests
   python fasta.py rules [--out BENCHMARK_RULES.md]           # Day 1: the benchmark rules
   python fasta.py setup --dir geneweaver_bench               # Day 1: project folders + rules + manifest
   python fasta.py mockgenome --scale 0.0005 --out-dir mock_genome --verify   # Day 2
   python fasta.py inspect genome.fa [--guides g.fa] [--parser auto|bio|builtin] [--crosscheck]   # Day 3
+  python fasta.py chunks genome.fa --chunk-size 1000000 --config C4 [--guides g.fa --verify]   # Day 4
 """
 from __future__ import annotations
 
@@ -159,6 +160,8 @@ def setup_project(root: str) -> list:
     }
     for name, text in files.items():
         p = os.path.join(root, name)
+        if name == "m.json" and os.path.exists(p):         # never overwrite a manifest the user has edited
+            continue
         with open(p, "w") as fh:
             fh.write(text)
         made.append(p)
@@ -247,7 +250,8 @@ class Hit:
 
 def normalize(hits) -> list[Hit]:
     """Rules s6.1: dedupe + stable order."""
-    return sorted(set(hits), key=lambda h: (h.guide_id, h.chrom, h.start, h.strand))
+    # full tie-breaker: several hits can share (guide, chrom, start, strand) with different edits/lengths
+    return sorted(set(hits), key=lambda h: (h.guide_id, h.chrom, h.start, h.strand, h.mm, h.db, h.rb, h.target))
 
 
 def write_hits(hits, path: str) -> None:
@@ -299,10 +303,6 @@ def _rc(s):
 def _random_seq(rng, n, gc):
     w = [(1 - gc) / 2, gc / 2, gc / 2, (1 - gc) / 2]
     return "".join(rng.choices("ACGT", w, k=n))
-
-
-def _deplete_cpg(rng, s, keep=0.25):
-    return re.sub("CG", lambda m: m.group(0) if rng.random() < keep else rng.choice(("TG", "CA")), s)
 
 
 def _mutate(rng, s, div):
@@ -458,7 +458,7 @@ def plant_sites(rng, genome, guides, copies, max_mm, bulge_copies, pam="NGG"):
             if b"N" in ba[s - 5:s + len(window) + 5]:
                 continue
             return c, s
-        raise RuntimeError("could not find a free site; use a larger --scale")
+        raise RuntimeError("could not find a free site for all planted sequences; use a larger --scale or fewer guides/copies")
 
     for gid, spacer in guides:
         jobs = [(0 if k == 0 else rng.randint(0, max_mm), None) for k in range(copies)]
@@ -491,8 +491,23 @@ def _stats(genome):
 
 def generate_mock(scale=0.0005, chroms=None, seed=20260101, n_guides=10, copies=5,
                   max_mm=4, bulge_copies=2, guide_len=20, pam="NGG"):
-    rng = random.Random(seed)
+    if scale <= 0:
+        raise ValueError("scale must be greater than zero")
+    bad = [c for c in (chroms or []) if c not in GRCH38_MB]
+    if bad:
+        raise ValueError(f"unknown chromosome(s): {', '.join(bad)} (use chr1-chr22, chrX, chrY)")
+    if n_guides < 1 or copies < 1:
+        raise ValueError("need at least 1 guide and 1 copy per guide")
+    if bulge_copies < 0:
+        raise ValueError("bulge copies cannot be negative")
+    if not 0 <= max_mm <= min(10, guide_len):
+        raise ValueError("max mismatches for planted sites must be between 0 and 10")
     names = chroms or list(GRCH38_MB)
+    est_mb = sum(max(_MIN_CHROM / 1e6, GRCH38_MB[c] * scale) for c in names)
+    if est_mb > 200:
+        raise ValueError(f"mock genome would be about {est_mb:.0f} Mb; the pure-Python generator is meant for small "
+                         "scales (try --scale 0.001)")
+    rng = random.Random(seed)
     fam = _families(rng)
     genome = {}
     for name in names:
@@ -784,7 +799,8 @@ def genome_report(path, parser="auto", fmt=None):
 def format_report(rep, top=8):
     L = [f"parser      : {rep['parser']} ({rep['format']})",
          f"sequences   : {rep['n_records']}   total {rep['total_bp']:,} bp",
-         f"N fraction  : {rep['n_fraction']}   soft-masked: {rep['masked_fraction']}   GC: {rep['gc_percent']}%",
+         f"N fraction  : {rep['n_fraction']}   soft-masked: {rep['masked_fraction']}   GC: "
+         + (f"{rep['gc_percent']}%" if rep["gc_percent"] is not None else "n/a (no A/C/G/T)"),
          f"sha256      : {rep['sha256']}"]
     for name, n in rep["records"][:top]:
         L.append(f"  {name:<24}{n:>14,} bp")
@@ -802,6 +818,67 @@ def crosscheck(path):
     if not HAVE_BIOPYTHON:
         return None
     return read_genome(path, "bio") == read_genome(path, "builtin")
+
+
+# ======================================================================
+# DAY 4 - Chunking with border overlap: split a chromosome into tiles that each read an overlap halo, so no site is lost at a border.
+# ======================================================================
+def required_overlap(cfg, guide_len=20):
+    """Bases of halo needed on each side of a chunk: the longest possible site window minus 1.
+    Longest window = guide + DNA bulges + PAM. (RNA bulges only shorten a site.)"""
+    return guide_len + cfg["db"] + len(cfg["pam"]) - 1
+
+
+def plan_chunks(length, chunk_size, overlap):
+    """Chunks as (own_start, own_end, read_start, read_end), half-open, in forward coordinates.
+    The owned ranges tile [0, length) exactly once. Each chunk READS `overlap` extra bases on both sides."""
+    if length < 0 or chunk_size < 1 or overlap < 0:
+        raise ValueError("need length >= 0, chunk_size >= 1, overlap >= 0")
+    plan = []
+    for own_s in range(0, length, chunk_size):
+        own_e = min(length, own_s + chunk_size)
+        plan.append((own_s, own_e, max(0, own_s - overlap), min(length, own_e + overlap)))
+    return plan
+
+
+def chunk_stats(lengths, chunk_size, overlap):
+    """Summary over chromosomes: number of chunks, bases owned, bases read, and the overlap overhead."""
+    n = owned = read = 0
+    for L in lengths:
+        for o_s, o_e, r_s, r_e in plan_chunks(L, chunk_size, overlap):
+            n += 1; owned += o_e - o_s; read += r_e - r_s
+    return dict(chunks=n, owned_bp=owned, read_bp=read, overhead=(read / owned - 1) if owned else 0.0)
+
+
+def chunked_search(genome, guides, cfg, chunk_size, overlap=None, search_fn=None):
+    """Search chunk by chunk and merge. A site is reported only by the chunk that owns its forward start,
+    so the result equals the unchunked search (given overlap >= required_overlap), with no duplicates.
+    search_fn(genome_dict, guides, cfg) -> hits; defaults to the CPU oracle (stand-in for a GPU tile kernel)."""
+    search_fn = search_fn or oracle_search
+    if not guides:
+        return []
+    if overlap is None:
+        overlap = required_overlap(cfg, max(len(g) for _, g in guides))
+    hits = []
+    for chrom, seq in genome.items():
+        for own_s, own_e, read_s, read_e in plan_chunks(len(seq), chunk_size, overlap):
+            for h in search_fn({chrom: seq[read_s:read_e]}, guides, cfg):
+                start = read_s + h.start                       # back to chromosome coordinates
+                if own_s <= start < own_e:
+                    hits.append(Hit(h.guide_id, chrom, start, h.strand, h.mm, h.db, h.rb, h.target))
+    return normalize(hits)
+
+
+def format_chunk_plan(genome_lengths, chunk_size, cfg, guide_len, cfg_name=""):
+    ov = required_overlap(cfg, guide_len)
+    st = chunk_stats(genome_lengths, chunk_size, ov)
+    return "\n".join([
+        f"genome      : {len(genome_lengths)} sequences, {sum(genome_lengths):,} bp",
+        f"config      : {cfg_name} (PAM {cfg['pam']}, mismatches {cfg['mm']}, DNA bulges {cfg['db']}, RNA bulges {cfg['rb']})",
+        f"overlap     : {ov} bp on each side  (= guide {guide_len} + DNA bulges {cfg['db']} + PAM {len(cfg['pam'])} - 1)",
+        f"chunk size  : {chunk_size:,} bp",
+        f"chunks      : {st['chunks']:,}",
+        f"bases read  : {st['read_bp']:,} for {st['owned_bp']:,} owned  (overlap overhead {st['overhead']:.4%})"])
 
 
 # ======================================================================
@@ -955,6 +1032,32 @@ def selftest():
             check("Biopython and built-in parsers agree", crosscheck(fa) is True)
     else:
         print("  [skip] Biopython not installed (pip install biopython): cross-check skipped")
+    print("Day 4 - chunking with border overlap")
+    check("required overlap = guide + DNA bulges + PAM - 1 (C2: 22, C4: 23, 23-nt guide: 25)",
+          required_overlap(CONFIGS["C2"], 20) == 22 and required_overlap(CONFIGS["C4"], 20) == 23
+          and required_overlap(CONFIGS["C2"], 23) == 25)
+    plan = plan_chunks(1000, 300, 22)
+    check("owned ranges tile the chromosome exactly once",
+          [(p[0], p[1]) for p in plan] == [(0, 300), (300, 600), (600, 900), (900, 1000)])
+    check("each chunk reads an overlap halo on both sides, clipped at the ends",
+          plan[0][2:] == (0, 322) and plan[1][2:] == (278, 622) and plan[-1][2:] == (878, 1000))
+    r4 = random.Random(SEED)
+    rnd = lambda n: "".join(r4.choice("ACGT") for _ in range(n))
+    sp = "GACGTCTAGCATCGATCGAA"
+    site = sp + "TGG"
+    g4 = {"c": rnd(49) + site + rnd(77) + revcomp(site) + rnd(100) + sp[:10] + "T" + sp[10:] + "CGG" + rnd(60)}
+    gd4 = [("g0", sp)]
+    c2 = dict(CONFIGS["C2"], mm=2)
+    c4 = dict(CONFIGS["C4"], mm=2)
+    keys = lambda hs: {h.key() for h in hs}
+    full2, full4 = oracle_search(g4, gd4, c2), oracle_search(g4, gd4, c4)
+    check("sites planted across chunk borders are found by the unchunked search", len(full2) >= 2 and len(full4) >= 3)
+    check("chunked == unchunked, mismatch config, chunk sizes 7/50/97/1000",
+          all(chunked_search(g4, gd4, c2, n) == full2 for n in (7, 50, 97, 1000)))
+    check("chunked == unchunked, with DNA/RNA bulges, chunk sizes 50/97",
+          all(chunked_search(g4, gd4, c4, n) == full4 for n in (50, 97)))
+    check("one base too little overlap loses a border site",
+          keys(chunked_search(g4, gd4, c2, 50, overlap=required_overlap(c2) - 1)) != keys(full2))
     print("SELFTEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -997,6 +1100,14 @@ def main(argv=None):
     i.add_argument("--guides", help="guide FASTA or TSV to validate")
     i.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     i.add_argument("--crosscheck", action="store_true", help="check Biopython and the built-in parser agree")
+    c = sub.add_parser("chunks", help="Day 4: show the chunk plan (and optionally verify chunked == unchunked)")
+    c.add_argument("path", help="genome FASTA (.gz ok)")
+    c.add_argument("--chunk-size", type=int, default=1_000_000)
+    c.add_argument("--config", default="C4", choices=sorted(CONFIGS))
+    c.add_argument("--guide-len", type=int, default=20)
+    c.add_argument("--guides", help="guide FASTA/TSV, used by --verify")
+    c.add_argument("--verify", action="store_true", help="check chunked search == unchunked search (small genomes only)")
+    c.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -1026,6 +1137,26 @@ def main(argv=None):
         except (ValueError, RuntimeError, OSError) as e:
             print("ERROR:", e)
             return 2
+    if a.command == "chunks":
+        try:
+            genome = read_genome(a.path, a.parser)
+            cfg = CONFIGS[a.config]
+            print(format_chunk_plan([len(s) for s in genome.values()], a.chunk_size, cfg, a.guide_len, a.config))
+            if not a.verify:
+                return 0
+            if not a.guides:
+                print("ERROR: --verify needs --guides")
+                return 2
+            if sum(len(s) for s in genome.values()) > 400_000:
+                print("verify skipped: genome is over 400,000 bp (the CPU oracle is slow); use a smaller genome")
+                return 0
+            guides = read_guides_any(a.guides, a.parser)
+            same = chunked_search(genome, guides, cfg, a.chunk_size) == oracle_search(genome, guides, cfg)
+            print("verify      : chunked search == unchunked search" if same else "verify      : MISMATCH between chunked and unchunked")
+            return 0 if same else 1
+        except (ValueError, RuntimeError, OSError) as e:
+            print("ERROR:", e)
+            return 2
     if a.command == "rules":
         if a.out:
             _write(a.out, rules_markdown())
@@ -1034,13 +1165,20 @@ def main(argv=None):
             print(rules_markdown())
         return 0
     if a.command == "setup":
+        kept = os.path.exists(os.path.join(a.dir, "m.json"))
         for p in setup_project(a.dir):
             print("created", p)
+        if kept:
+            print("kept    ", os.path.join(a.dir, "m.json"), "(already exists; not overwritten)")
         print(f"next: put FASTA files in {os.path.join(a.dir, 'data')} and edit {os.path.join(a.dir, 'm.json')}")
         return 0
     if a.scale <= 0:
         ap.error("--scale must be greater than zero")
-    return cmd_mockgenome(a)
+    try:
+        return cmd_mockgenome(a)
+    except (ValueError, RuntimeError, OSError) as e:
+        print("ERROR:", e)
+        return 2
 
 
 if __name__ == "__main__":
