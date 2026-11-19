@@ -1,0 +1,30 @@
+{
+  "tool": "pure-python-baseline",
+  "configuration": {
+    "pam": "NGG",
+    "mm": 4,
+    "db": 0,
+    "rb": 0
+  },
+  "genome_bp": 40000,
+  "guide_count": 2,
+  "warmup_runs": 1,
+  "timed_runs": 5,
+  "raw_timing_seconds": [
+    0.2790738999610767,
+    0.27668539993464947,
+    0.2609613999957219,
+    0.2573549000080675,
+    0.2610667999833822
+  ],
+  "median_search_seconds": 0.2610667999833822,
+  "guide_positions_per_second": 612869.9628224827,
+  "hits": 11,
+  "hits_per_second": 42.134809944045685,
+  "recorded_at": "2026-11-19T14:23:57.659551+00:00",
+  "config_name": "C2",
+  "genome_path": "mock_genome/genome.fa",
+  "guides_path": "mock_genome/guides.tsv",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.14.3"
+}

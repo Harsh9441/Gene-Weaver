@@ -1,4 +1,4 @@
-"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.  Day 4: chunking with border overlap.
+"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.  Day 4: chunking with border overlap.  Day 5: timed pure-Python baseline.
 
   python fasta.py selftest                                   # all tests
   python fasta.py rules [--out BENCHMARK_RULES.md]           # Day 1: the benchmark rules
@@ -6,6 +6,7 @@
   python fasta.py mockgenome --scale 0.0005 --out-dir mock_genome --verify   # Day 2
   python fasta.py inspect genome.fa [--guides g.fa] [--parser auto|bio|builtin] [--crosscheck]   # Day 3
   python fasta.py chunks genome.fa --chunk-size 1000000 --config C4 [--guides g.fa --verify]   # Day 4
+  python fasta.py baseline genome.fa --guides guides.tsv [--config C2] [--runs 5] [--warmup 1] [--out baseline.json]
 """
 from __future__ import annotations
 
@@ -882,6 +883,61 @@ def format_chunk_plan(genome_lengths, chunk_size, cfg, guide_len, cfg_name=""):
 
 
 # ======================================================================
+# DAY 5 - Pure-Python CPU baseline and timing record.
+# ======================================================================
+import statistics
+import time
+
+
+def pure_python_baseline(genome, guides, cfg, warmup_runs=1, timed_runs=5):
+    """Run the pure-Python oracle and record search-only timing.
+
+    Loading the genome and guides happens before this function.  Each timed
+    run starts and stops the search clock around oracle_search only.
+    """
+    if warmup_runs < 0:
+        raise ValueError("warmup_runs cannot be negative")
+    if timed_runs < 1:
+        raise ValueError("timed_runs must be at least 1")
+
+    for _ in range(warmup_runs):
+        oracle_search(genome, guides, cfg)
+
+    timings = []
+    baseline_hits = None
+    for _ in range(timed_runs):
+        started = time.perf_counter()
+        hits = oracle_search(genome, guides, cfg)
+        timings.append(time.perf_counter() - started)
+        if baseline_hits is None:
+            baseline_hits = hits
+        elif hits != baseline_hits:
+            raise RuntimeError("baseline returned inconsistent hits across timed runs")
+
+    median_seconds = statistics.median(timings)
+    genome_bp = sum(len(seq) for seq in genome.values())
+    guide_positions = len(guides) * 2 * genome_bp
+    hit_count = len(baseline_hits)
+    return {
+        "tool": "pure-python-baseline",
+        "configuration": dict(cfg),
+        "genome_bp": genome_bp,
+        "guide_count": len(guides),
+        "warmup_runs": warmup_runs,
+        "timed_runs": timed_runs,
+        "raw_timing_seconds": timings,
+        "median_search_seconds": median_seconds,
+        "guide_positions_per_second": (guide_positions / median_seconds) if median_seconds else 0.0,
+        "hits": hit_count,
+        "hits_per_second": (hit_count / median_seconds) if median_seconds else 0.0,
+    }
+
+
+# Short alias for callers that describe this as a benchmark rather than a run.
+run_pure_python_baseline = pure_python_baseline
+
+
+# ======================================================================
 # WEEK 1 TESTS AND COMMAND LINE (Day 1 rules/setup + Day 2 mock genome)
 # ======================================================================
 import argparse, gzip, sys, tempfile
@@ -1058,6 +1114,14 @@ def selftest():
           all(chunked_search(g4, gd4, c4, n) == full4 for n in (50, 97)))
     check("one base too little overlap loses a border site",
           keys(chunked_search(g4, gd4, c2, 50, overlap=required_overlap(c2) - 1)) != keys(full2))
+    print("Day 5 - pure-Python CPU baseline")
+    baseline = pure_python_baseline(g4, gd4, c2, warmup_runs=1, timed_runs=3)
+    check("baseline timing record contains runs, median and throughput",
+          baseline["timed_runs"] == 3 and len(baseline["raw_timing_seconds"]) == 3
+          and baseline["median_search_seconds"] >= 0
+          and baseline["guide_positions_per_second"] > 0)
+    check("baseline hit count matches the CPU oracle",
+          baseline["hits"] == len(full2))
     print("SELFTEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1088,7 +1152,7 @@ def cmd_mockgenome(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="GeneWeaver Week 1: Day 1 setup + benchmark rules, Day 2 mock human genome generator")
+    ap = argparse.ArgumentParser(description="GeneWeaver Week 1: benchmark setup, mock genome, parsing, chunking, and CPU baseline")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("selftest", aliases=["test"], help="run all Day 1 and Day 2 tests")
     r = sub.add_parser("rules", help="Day 1: print the benchmark rules (or write them to a file)")
@@ -1116,6 +1180,14 @@ def main(argv=None):
     m.add_argument("--max-mm", type=int, default=4); m.add_argument("--bulge-copies", type=int, default=2)
     m.add_argument("--verify", action="store_true", help="fast check of every planted site")
     m.add_argument("--verify-oracle", action="store_true", help="full CPU search (small genomes only)")
+    b = sub.add_parser("baseline", help="Day 5: time the pure-Python CPU baseline")
+    b.add_argument("path", help="genome FASTA (.gz ok)")
+    b.add_argument("--guides", required=True, help="guide FASTA or TSV")
+    b.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+    b.add_argument("--warmup", type=int, default=1, help="untimed warm-up runs")
+    b.add_argument("--runs", type=int, default=5, help="timed runs")
+    b.add_argument("--out", help="write the timing record as JSON")
+    b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     a = ap.parse_args(argv)
     if a.command in ("selftest", "test"):
         return selftest()
@@ -1172,6 +1244,31 @@ def main(argv=None):
             print("kept    ", os.path.join(a.dir, "m.json"), "(already exists; not overwritten)")
         print(f"next: put FASTA files in {os.path.join(a.dir, 'data')} and edit {os.path.join(a.dir, 'm.json')}")
         return 0
+    if a.command == "baseline":
+        try:
+            genome = read_genome(a.path, a.parser)
+            guides = read_guides_any(a.guides, a.parser)
+            record = pure_python_baseline(genome, guides, CONFIGS[a.config],
+                                          warmup_runs=a.warmup, timed_runs=a.runs)
+            print(f"tool        : {record['tool']}")
+            print(f"config      : {a.config}")
+            print(f"genome      : {record['genome_bp']:,} bp")
+            print(f"guides      : {record['guide_count']:,}")
+            print(f"timings     : {[round(t, 6) for t in record['raw_timing_seconds']]}")
+            print(f"median      : {record['median_search_seconds']:.6f} seconds")
+            print(f"throughput  : {record['guide_positions_per_second']:.2f} guide-positions/second")
+            print(f"hits        : {record['hits']:,}")
+            print(f"hit speed   : {record['hits_per_second']:.2f} hits/second")
+            if a.out:
+                record["config"] = a.config
+                record["genome_path"] = a.path
+                record["guides_path"] = a.guides
+                _write(a.out, json.dumps(record, indent=2) + "\n")
+                print(f"record      : {a.out}")
+            return 0
+        except (ValueError, RuntimeError, OSError) as e:
+            print("ERROR:", e)
+            return 2
     if a.scale <= 0:
         ap.error("--scale must be greater than zero")
     try:
