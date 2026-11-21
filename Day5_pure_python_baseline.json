@@ -11,20 +11,17 @@
   "warmup_runs": 1,
   "timed_runs": 5,
   "raw_timing_seconds": [
-    0.2790738999610767,
-    0.27668539993464947,
-    0.2609613999957219,
-    0.2573549000080675,
-    0.2610667999833822
+    0.2263451999751851,
+    0.18861779989674687,
+    0.19118900003377348,
+    0.19137449993286282,
+    0.18855899991467595
   ],
-  "median_search_seconds": 0.2610667999833822,
-  "guide_positions_per_second": 612869.9628224827,
+  "median_search_seconds": 0.19118900003377348,
+  "guide_positions_per_second": 836868.2297189485,
   "hits": 11,
-  "hits_per_second": 42.134809944045685,
-  "recorded_at": "2026-11-19T14:23:57.659551+00:00",
-  "config_name": "C2",
-  "genome_path": "mock_genome/genome.fa",
-  "guides_path": "mock_genome/guides.tsv",
-  "platform": "Windows-11-10.0.26300-SP0",
-  "python": "3.14.3"
+  "hits_per_second": 57.53469079317771,
+  "config": "C2",
+  "genome_path": ".\\mock_genome\\genome.fa",
+  "guides_path": ".\\mock_genome\\guides.tsv"
 }

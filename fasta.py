@@ -1,4 +1,4 @@
-"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.  Day 4: chunking with border overlap.  Day 5: timed pure-Python baseline.
+"""GeneWeaver Week 1 - Day 1: setup + benchmark rules.  Day 2: mock human genome generator.  Day 3: Biopython parsing.  Day 4: chunking with border overlap.  Day 5: pure-Python baseline + timing.
 
   python fasta.py selftest                                   # all tests
   python fasta.py rules [--out BENCHMARK_RULES.md]           # Day 1: the benchmark rules
@@ -6,7 +6,11 @@
   python fasta.py mockgenome --scale 0.0005 --out-dir mock_genome --verify   # Day 2
   python fasta.py inspect genome.fa [--guides g.fa] [--parser auto|bio|builtin] [--crosscheck]   # Day 3
   python fasta.py chunks genome.fa --chunk-size 1000000 --config C4 [--guides g.fa --verify]   # Day 4
-  python fasta.py baseline genome.fa --guides guides.tsv [--config C2] [--runs 5] [--warmup 1] [--out baseline.json]
+  python fasta.py animate [--delay 0.45] [--plain]                                           # Day 4 animation
+  python fasta.py baseline [--config C2] [--runs 5]                                          # Day 5: timed pure-Python baseline
+  python fasta.py --debug baseline [--runs 5]                                                # verbose diagnostics
+  python fasta.py baseline --debug [--runs 5]                                                # same, flag after command
+  GENEWEAVER_DEBUG=1 python fasta.py selftest                                                # enable diagnostics via environment
 """
 from __future__ import annotations
 
@@ -201,18 +205,27 @@ def pam_matches(window: str, pam: str) -> bool:
 
 
 def read_fasta(path: str) -> dict[str, str]:
-    """Upper-cases (soft-mask is sequence), maps non-ACGT to N, name = header up to first space."""
+    """Upper-cases (soft-mask is sequence), maps non-ACGT to N, name = header up to first space.
+    Same rules as the Day 3 built-in parser: a bare '>' header gives the name "", text before the first
+    header is ignored, and a repeated name is an error (it used to silently overwrite the first record)."""
     genome, name, parts = {}, None, []
+
+    def finish():
+        if name in genome:
+            raise ValueError(f"duplicate sequence name {name!r} in {path}")
+        genome[name] = re.sub("[^ACGT]", "N", "".join(parts).upper())
+
     with open(path) as fh:
         for line in fh:
             if line.startswith(">"):
                 if name is not None:
-                    genome[name] = re.sub("[^ACGT]", "N", "".join(parts).upper())
-                name, parts = line[1:].split()[0], []
-            else:
+                    finish()
+                head = line[1:].split()
+                name, parts = (head[0] if head else ""), []
+            elif name is not None:
                 parts.append(line.strip())
     if name is not None:
-        genome[name] = re.sub("[^ACGT]", "N", "".join(parts).upper())
+        finish()
     return genome
 
 
@@ -883,58 +896,285 @@ def format_chunk_plan(genome_lengths, chunk_size, cfg, guide_len, cfg_name=""):
 
 
 # ======================================================================
-# DAY 5 - Pure-Python CPU baseline and timing record.
+# DAY 4 (animation) - Terminal animation of the chunked scan with border overlap
 # ======================================================================
-import statistics
 import time
 
 
-def pure_python_baseline(genome, guides, cfg, warmup_runs=1, timed_runs=5):
-    """Run the pure-Python oracle and record search-only timing.
+def demo_genome(length=420, chunk_size=60, seed=SEED):
+    """Small synthetic genome with five planted sites; three of them cross a chunk border."""
+    rng = random.Random(seed)
+    sp = "GACGTCTAGCATCGATCGAA"
+    seq = [rng.choice("ACGT") for _ in range(length)]
 
-    Loading the genome and guides happens before this function.  Each timed
-    run starts and stops the search clock around oracle_search only.
-    """
-    if warmup_runs < 0:
-        raise ValueError("warmup_runs cannot be negative")
-    if timed_runs < 1:
-        raise ValueError("timed_runs must be at least 1")
+    def put(start, spacer, pam, strand):
+        site = spacer + pam
+        w = site if strand == "+" else revcomp(site)
+        if 0 <= start and start + len(w) <= length:
+            seq[start:start + len(w)] = list(w)
 
-    for _ in range(warmup_runs):
-        oracle_search(genome, guides, cfg)
-
-    timings = []
-    baseline_hits = None
-    for _ in range(timed_runs):
-        started = time.perf_counter()
-        hits = oracle_search(genome, guides, cfg)
-        timings.append(time.perf_counter() - started)
-        if baseline_hits is None:
-            baseline_hits = hits
-        elif hits != baseline_hits:
-            raise RuntimeError("baseline returned inconsistent hits across timed runs")
-
-    median_seconds = statistics.median(timings)
-    genome_bp = sum(len(seq) for seq in genome.values())
-    guide_positions = len(guides) * 2 * genome_bp
-    hit_count = len(baseline_hits)
-    return {
-        "tool": "pure-python-baseline",
-        "configuration": dict(cfg),
-        "genome_bp": genome_bp,
-        "guide_count": len(guides),
-        "warmup_runs": warmup_runs,
-        "timed_runs": timed_runs,
-        "raw_timing_seconds": timings,
-        "median_search_seconds": median_seconds,
-        "guide_positions_per_second": (guide_positions / median_seconds) if median_seconds else 0.0,
-        "hits": hit_count,
-        "hits_per_second": (hit_count / median_seconds) if median_seconds else 0.0,
-    }
+    other = lambda b: "A" if b != "A" else "C"
+    mm1 = sp[:6] + other(sp[6]) + sp[7:]
+    mm2 = sp[:3] + other(sp[3]) + sp[4:12] + other(sp[12]) + sp[13:]
+    c = chunk_size
+    put(c - 10, sp, "TGG", "+")            # crosses border 1
+    put(2 * c + 8, sp, "AGG", "-")         # inside one chunk
+    put(3 * c - 14, mm1, "CGG", "-")       # crosses border 3
+    put(4 * c + 20, mm2, "TGG", "+")       # inside one chunk
+    put(5 * c - 5, sp, "GGG", "+")         # crosses border 5
+    return "".join(seq), [("g0", sp)]
 
 
-# Short alias for callers that describe this as a benchmark rather than a run.
-run_pure_python_baseline = pure_python_baseline
+def animation_frames(length=420, chunk_size=60, width=64):
+    """Frames (strings of 6 lines each) showing each chunk being read with its halo and the hits it reports."""
+    cfg = dict(CONFIGS["C2"], mm=2)
+    seq, guides = demo_genome(length, chunk_size)
+    ov = required_overlap(cfg, len(guides[0][1]))
+    plan = plan_chunks(len(seq), chunk_size, ov)
+    per_chunk = []
+    for own_s, own_e, rs, re_ in plan:
+        hs = [Hit(h.guide_id, "c", rs + h.start, h.strand, h.mm, h.db, h.rb, h.target)
+              for h in oracle_search({"c": seq[rs:re_]}, guides, cfg) if own_s <= rs + h.start < own_e]
+        per_chunk.append(hs)
+    full = oracle_search({"c": seq}, guides, cfg)
+    no_overlap = chunked_search({"c": seq}, guides, cfg, chunk_size, overlap=0)
+    borders = list(range(chunk_size, length, chunk_size))
+    col = lambda p: min(width - 1, p * width // length)
+    crosses = lambda h: any(h.start < b < h.start + len(h.target) for b in borders)
+    ruler = ["-"] * width
+    for b in borders:
+        ruler[col(b)] = "|"
+    ruler = "".join(ruler)
+    legend = "legend:  + forward hit   - reverse hit   * hit crossing a chunk border   = owned   . overlap halo"
+    head = "GeneWeaver Day 4 - chunked scan with border overlap"
+    info = f"{length} bp, chunk {chunk_size} bp, overlap {ov} bp each side"
+
+    def make(scan_row, status, found, summary=""):
+        hit_row = [" "] * width
+        for h in found:
+            hit_row[col(h.start)] = "*" if crosses(h) else h.strand
+        n_cross = sum(crosses(h) for h in found)
+        return "\n".join([head,
+                          f"genome |{ruler}|  {info}",
+                          f"scan   |{scan_row}|  {status}",
+                          f"hits   |{''.join(hit_row)}|  found {len(found)} so far, {n_cross} cross a border",
+                          summary, legend])
+
+    blank = " " * width
+    found = []
+    frames = [make(blank, "ready", found)]
+    for i, ((own_s, own_e, rs, re_), hs) in enumerate(zip(plan, per_chunk), 1):
+        row = [" "] * width
+        for p in range(rs, re_):
+            row[col(p)] = "."
+        for p in range(own_s, own_e):
+            row[col(p)] = "="
+        frames.append(make("".join(row), f"chunk {i}/{len(plan)}: reading {rs}-{re_} (owns {own_s}-{own_e})", found))
+        found = found + hs
+        frames.append(make("".join(row), f"chunk {i}/{len(plan)}: reported {len(hs)} hit(s)", found))
+    same = len(found) == len(full) and {h.key() for h in found} == {h.key() for h in full}
+    frames.append(make(blank, "done", found,
+                       f"with overlap: {len(found)} hits | without overlap: {len(no_overlap)} | unchunked: {len(full)}"
+                       f"  ->  {'identical to the unchunked search' if same else 'MISMATCH'}"))
+    return frames
+
+
+def play_frames(frames, delay=0.4, ansi=True, out=None):
+    """Play frames in place (ANSI cursor moves) or, with ansi=False, print them one after another."""
+    out = out or sys.stdout
+    if ansi and os.name == "nt":
+        os.system("")                                    # turns on ANSI escape codes in the Windows console
+    prev = 0
+    for k, frame in enumerate(frames):
+        lines = frame.split("\n")
+        if ansi and k:
+            out.write(f"\033[{prev}A")
+        for ln in lines:
+            out.write(("\033[K" if ansi else "") + ln + "\n")
+        out.flush()
+        prev = len(lines)
+        if k < len(frames) - 1:
+            if not ansi:
+                out.write("\n")
+            if delay:
+                time.sleep(delay)
+
+
+# ======================================================================
+# DAY 5 - Pure-Python baseline: 2-bit packed XOR + popcount search, with its time recorded (Rules s2, s7)
+# ======================================================================
+import datetime, json, platform, statistics, tracemalloc
+
+_TO_DIGIT = str.maketrans("ACGT", "0123")          # A=00 C=01 G=10 T=11, read as a base-4 number
+_NON_ACGT = re.compile("[^ACGT]")
+try:
+    _popcount = int.bit_count                      # Python 3.10+
+except AttributeError:
+    _popcount = lambda x: bin(x).count("1")
+
+
+def _pam_regex(pam):
+    """Zero-width regex that matches every position where the PAM pattern fits (IUPAC; genome N never matches)."""
+    return re.compile("(?=(" + "".join("[" + IUPAC[c] + "]" for c in pam) + "))")
+
+
+def packed_search(genome, guides, cfg):
+    """Mismatch-only search, both strands. Same hits as oracle_search for configs without bulges, much faster:
+    find PAM sites with a regex first, pack each candidate spacer into an integer (2 bits per base), then count
+    mismatches per guide with XOR and a popcount. This is the same idea the GPU kernel will use."""
+    if cfg["db"] or cfg["rb"]:
+        raise ValueError("the packed baseline handles mismatch-only configs (C1, C2, C3, C6); "
+                         "use the CPU oracle for configs with bulges")
+    pam, pl, mm = cfg["pam"], len(cfg["pam"]), cfg["mm"]
+    rx = _pam_regex(pam)
+    by_len = {}
+    for gid, g in guides:
+        by_len.setdefault(len(g), []).append((gid, g, int(g.translate(_TO_DIGIT), 4) if not _NON_ACGT.search(g) else None))
+    hits = []
+    for chrom, seq in genome.items():
+        for strand, s in (("+", seq), ("-", revcomp(seq))):
+            n = len(s)
+            for L, group in by_len.items():
+                mask = int("01" * L, 2)                       # low bit of every 2-bit pair
+                for m in rx.finditer(s):
+                    p = m.start()                              # PAM starts here; spacer is the L bases before it
+                    if p < L:
+                        continue
+                    spacer = s[p - L:p]
+                    start = (p - L) if strand == "+" else n - (p + pl)
+                    clean = not _NON_ACGT.search(spacer)
+                    a = int(spacer.translate(_TO_DIGIT), 4) if clean else None
+                    for gid, g, gv in group:
+                        if clean and gv is not None:
+                            x = a ^ gv
+                            d = _popcount((x | (x >> 1)) & mask)
+                            if d > mm:
+                                continue
+                        else:                                  # N in the genome, or IUPAC letters in the guide
+                            d = count_mm(g, spacer, mm)
+                            if d is None:
+                                continue
+                        hits.append(Hit(gid, chrom, start, strand, d, 0, 0, spacer + s[p:p + pl]))
+    return normalize(hits)
+
+
+def summarize_times(xs):
+    """Median and interquartile range; flags a run set as unstable if any run is >20% from the median (Rules s7.2)."""
+    med = statistics.median(xs)
+    q = statistics.quantiles(xs, n=4) if len(xs) >= 2 else [xs[0]] * 3
+    return dict(median=med, q1=q[0], q3=q[2], min=min(xs), max=max(xs),
+                unstable=any(abs(x - med) / med > 0.20 for x in xs) if med else False)
+
+
+def gps(n_guides, genome_len, seconds):
+    """Throughput in guide-positions per second = G x 2L / t (both strands), Rules s2."""
+    return n_guides * 2 * genome_len / seconds
+
+
+def time_runs(fn, runs=5, warmup=1):
+    """Rules s7.2: untimed warm-up run(s), then `runs` timed runs. Returns (list of seconds, last result)."""
+    if runs < 1 or warmup < 0:
+        raise ValueError("need runs >= 1 and warmup >= 0")
+    for _ in range(warmup):
+        fn()
+    times, result = [], None
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        result = fn()
+        times.append(time.perf_counter() - t0)
+    return times, result
+
+
+def peak_memory_mb(fn):
+    """Peak Python-level memory (MB) of one extra, untimed run (tracemalloc slows code, so it is never timed)."""
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1] / 1e6
+    finally:
+        tracemalloc.stop()
+
+
+def hardware_info():
+    info = dict(os=platform.platform(), cpu=platform.processor() or platform.machine(), cores=os.cpu_count(),
+                python=f"{platform.python_implementation()} {platform.python_version()}")
+    try:
+        info["ram_gb"] = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1)
+    except (AttributeError, ValueError, OSError):
+        pass
+    return info
+
+
+def genome_digest(genome):
+    h = hashlib.sha256()
+    for name, seq in genome.items():
+        h.update(f"{name}\n{seq}\n".encode())
+    return h.hexdigest()
+
+
+def baseline_record(impl, genome_id, genome_sha, genome_bp, guide_set, n_guides, config, times, n_hits,
+                    peak_mb, correctness, load_s=None):
+    """One JSON-ready record in the Rules s10 shape, for the pure-Python baseline."""
+    st = summarize_times(times)
+    return dict(tool="pure-python-baseline", implementation=impl, rules_version=RULES_VERSION,
+                created=datetime.datetime.now().isoformat(timespec="seconds"),
+                genome=genome_id, genome_sha256=genome_sha, genome_bp=genome_bp, guide_set=guide_set, n_guides=n_guides,
+                config=config, config_detail=CONFIGS[config], runs_s=[round(t, 6) for t in times],
+                median_search_s=st["median"], iqr_s=[st["q1"], st["q3"]], unstable=st["unstable"],
+                gps=gps(n_guides, genome_bp, st["median"]) if st["median"] else None, total_hits=n_hits,
+                peak_python_mem_mb=round(peak_mb, 2), load_s=load_s, correctness=correctness, hardware=hardware_info())
+
+
+def format_baseline(rec, saved=None):
+    r = rec
+    chk = r["correctness"]
+    L = [f"pure-Python baseline ({r['implementation']})",
+         f"genome      : {r['genome']}  {r['genome_bp']:,} bp   guides: {r['n_guides']} ({r['guide_set']})   config {r['config']}",
+         f"runs (s)    : " + "  ".join(f"{t:.3f}" for t in r["runs_s"]),
+         f"median      : {r['median_search_s']:.3f} s   IQR {r['iqr_s'][0]:.3f}-{r['iqr_s'][1]:.3f} s   "
+         + ("UNSTABLE (a run was >20% from the median; re-run on an idle machine)" if r["unstable"] else "stable"),
+         f"throughput  : {r['gps']:.3e} guide-positions/s",
+         f"hits        : {r['total_hits']}   peak Python memory {r['peak_python_mem_mb']} MB"]
+    if chk.get("planted_total") is not None:
+        L.append(f"check       : planted sites found {chk['planted_found']}/{chk['planted_total']}")
+    elif chk.get("note"):
+        L.append(f"check       : {chk['note']}")
+    if saved:
+        L.append(f"saved       : {saved}")
+    return "\n".join(L)
+
+
+def run_baseline(genome, guides, config, impl="packed", runs=5, warmup=1, genome_id="G-mock", guide_set="S-mock",
+                 truth=None, load_s=None, genome_sha=None):
+    """Time the baseline and return its record. `truth` = planted rows, used for a correctness check."""
+    cfg = CONFIGS[config]
+    search = packed_search if impl == "packed" else oracle_search
+    fn = lambda: search(genome, guides, cfg)
+    times, hits = time_runs(fn, runs, warmup)
+    peak = peak_memory_mb(fn)
+    correctness = dict(note="not checked (no planted truth for this genome)")
+    if truth is not None:
+        found = {h.key() for h in hits}
+        want = [t for t in truth if t[5] == 0 and t[6] == 0 and t[4] <= cfg["mm"]]     # planted, within this budget
+        correctness = dict(planted_total=len(want), planted_found=sum((t[0], t[1], t[2], t[3]) in found for t in want))
+    return baseline_record(impl, genome_id, genome_sha or genome_digest(genome), sum(len(x) for x in genome.values()),
+                           guide_set, len(guides), config, times, len(hits), peak, correctness, load_s)
+
+
+def save_baseline(rec, out_dir):
+    """Write the record as JSON and append one summary line to baseline_log.jsonl, so timings accumulate."""
+    os.makedirs(out_dir, exist_ok=True)
+    # the genome fingerprint keeps records of different genomes (or sizes) from overwriting each other
+    name = (f"baseline_{rec['genome']}_{rec['genome_sha256'][:8]}_{rec['guide_set']}_{rec['config']}_"
+            f"{rec['implementation']}.json").replace(os.sep, "_")
+    path = os.path.join(out_dir, name)
+    with open(path, "w") as fh:
+        json.dump(rec, fh, indent=2)
+    line = {k: rec[k] for k in ("created", "implementation", "genome", "genome_bp", "guide_set", "n_guides", "config",
+                                "median_search_s", "gps", "total_hits")}
+    with open(os.path.join(out_dir, "baseline_log.jsonl"), "a") as fh:
+        fh.write(json.dumps(line) + "\n")
+    return path
 
 
 # ======================================================================
@@ -966,6 +1206,14 @@ def verify_sites(genome, guides, truth, max_mm, pam="NGG"):
         if win != target or not pam_matches(p, pam) or best is None or sum(best) > mm + db + rb:
             bad.append((gid, c, s, strand))
     return dict(planted=len(truth), found=len(truth) - len(bad), missing=bad[:5])
+
+
+def _raises(exc, fn, *args):
+    try:
+        fn(*args)
+    except exc:
+        return True
+    return False
 
 
 def selftest():
@@ -1114,14 +1362,18 @@ def selftest():
           all(chunked_search(g4, gd4, c4, n) == full4 for n in (50, 97)))
     check("one base too little overlap loses a border site",
           keys(chunked_search(g4, gd4, c2, 50, overlap=required_overlap(c2) - 1)) != keys(full2))
-    print("Day 5 - pure-Python CPU baseline")
-    baseline = pure_python_baseline(g4, gd4, c2, warmup_runs=1, timed_runs=3)
-    check("baseline timing record contains runs, median and throughput",
-          baseline["timed_runs"] == 3 and len(baseline["raw_timing_seconds"]) == 3
-          and baseline["median_search_seconds"] >= 0
-          and baseline["guide_positions_per_second"] > 0)
-    check("baseline hit count matches the CPU oracle",
-          baseline["hits"] == len(full2))
+    print("Day 5 - pure-Python baseline and recorded timing")
+    check("packed XOR+popcount baseline == CPU oracle (mismatch config, both strands, border sites)",
+          packed_search(g4, gd4, c2) == oracle_search(g4, gd4, c2))
+    check("baseline refuses configs with bulges", all(
+        _raises(ValueError, packed_search, g4, gd4, CONFIGS[c]) for c in ("C4", "C5")))
+    st = summarize_times([1.0, 1.1, 0.9, 1.0, 1.0])
+    check("timing summary: median 1.0, stable; a 2x outlier is flagged unstable",
+          st["median"] == 1.0 and not st["unstable"] and summarize_times([1, 1, 1, 1, 2])["unstable"])
+    check("throughput = guides x 2 x length / seconds", gps(10, 1_000_000, 2.0) == 1e7)
+    calls = []
+    ts, _ = time_runs(lambda: calls.append(1), runs=5, warmup=1)
+    check("1 warm-up + 5 timed runs", len(calls) == 6 and len(ts) == 5)
     print("SELFTEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -1152,7 +1404,8 @@ def cmd_mockgenome(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="GeneWeaver Week 1: benchmark setup, mock genome, parsing, chunking, and CPU baseline")
+    ap = argparse.ArgumentParser(description="GeneWeaver Week 1: Day 1 setup + benchmark rules, Day 2 mock human genome generator")
+    ap.add_argument("-d", "--debug", action="store_true", help="print diagnostic details to stderr")
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("selftest", aliases=["test"], help="run all Day 1 and Day 2 tests")
     r = sub.add_parser("rules", help="Day 1: print the benchmark rules (or write them to a file)")
@@ -1172,6 +1425,25 @@ def main(argv=None):
     c.add_argument("--guides", help="guide FASTA/TSV, used by --verify")
     c.add_argument("--verify", action="store_true", help="check chunked search == unchunked search (small genomes only)")
     c.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+    an = sub.add_parser("animate", help="Day 4: play a terminal animation of the chunked scan")
+    an.add_argument("--length", type=int, default=420, help="demo genome length in bp")
+    an.add_argument("--chunk-size", type=int, default=60)
+    an.add_argument("--delay", type=float, default=0.45, help="seconds per frame")
+    an.add_argument("--plain", action="store_true", help="print frames one after another (no in-place redraw)")
+    b = sub.add_parser("baseline", help="Day 5: time the pure-Python baseline and record the result")
+    b.add_argument("-d", "--debug", action="store_true", default=argparse.SUPPRESS,
+                   help="print diagnostic details to stderr")
+    b.add_argument("--genome", help="genome FASTA; if omitted a mock human genome is generated")
+    b.add_argument("--guides", help="guide FASTA/TSV; if omitted guides are generated")
+    b.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+    b.add_argument("--impl", default="packed", choices=["packed", "oracle"],
+                   help="packed = 2-bit XOR+popcount baseline; oracle = naive reference (small genomes)")
+    b.add_argument("--runs", type=int, default=5); b.add_argument("--warmup", type=int, default=1)
+    b.add_argument("--scale", type=float, default=0.0005, help="mock genome size, fraction of GRCh38")
+    b.add_argument("--chroms", default="", help="mock genome chromosomes, e.g. chr21,chr22")
+    b.add_argument("--n-guides", type=int, default=10); b.add_argument("--seed", type=int, default=SEED)
+    b.add_argument("--out-dir", default="results"); b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+    b.add_argument("--force", action="store_true", help="allow the slow oracle on a large genome")
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -1180,17 +1452,22 @@ def main(argv=None):
     m.add_argument("--max-mm", type=int, default=4); m.add_argument("--bulge-copies", type=int, default=2)
     m.add_argument("--verify", action="store_true", help="fast check of every planted site")
     m.add_argument("--verify-oracle", action="store_true", help="full CPU search (small genomes only)")
-    b = sub.add_parser("baseline", help="Day 5: time the pure-Python CPU baseline")
-    b.add_argument("path", help="genome FASTA (.gz ok)")
-    b.add_argument("--guides", required=True, help="guide FASTA or TSV")
-    b.add_argument("--config", default="C2", choices=sorted(CONFIGS))
-    b.add_argument("--warmup", type=int, default=1, help="untimed warm-up runs")
-    b.add_argument("--runs", type=int, default=5, help="timed runs")
-    b.add_argument("--out", help="write the timing record as JSON")
-    b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     a = ap.parse_args(argv)
+    debug_env = os.environ.get("GENEWEAVER_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+    debug = a.debug or debug_env
+
+    def debug_log(message):
+        if debug:
+            print(f"[DEBUG] {message}", file=sys.stderr)
+
+    if debug:
+        source = "command-line flag" if a.debug else "GENEWEAVER_DEBUG"
+        debug_log(f"enabled by {source}; command={a.command}")
     if a.command in ("selftest", "test"):
-        return selftest()
+        debug_log("starting built-in self-test")
+        result = selftest()
+        debug_log(f"built-in self-test exit code={result}")
+        return result
     if a.command == "inspect":
         try:
             print(format_report(genome_report(a.path, a.parser)))
@@ -1229,6 +1506,51 @@ def main(argv=None):
         except (ValueError, RuntimeError, OSError) as e:
             print("ERROR:", e)
             return 2
+    if a.command == "animate":
+        if a.chunk_size < 20 or a.length < 6 * a.chunk_size + 25 or a.delay < 0:
+            print("ERROR: need --chunk-size >= 20, --length >= 6 x chunk size + 25, and --delay >= 0")
+            return 2
+        try:
+            play_frames(animation_frames(a.length, a.chunk_size), a.delay, ansi=sys.stdout.isatty() and not a.plain)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return 0
+    if a.command == "baseline":
+        try:
+            cfg = CONFIGS[a.config]
+            debug_log(f"baseline config={a.config} implementation={a.impl} runs={a.runs} warmup={a.warmup}")
+            if a.impl == "packed" and (cfg["db"] or cfg["rb"]):
+                print(f"ERROR: {a.config} has bulges; the packed baseline is mismatch-only. Use --impl oracle (slow) or C1/C2/C3/C6.")
+                return 2
+            truth, load_s, sha = None, None, None
+            if a.genome:
+                debug_log(f"reading genome from {a.genome}")
+                t0 = time.perf_counter()
+                genome = read_genome(a.genome, a.parser)
+                load_s = round(time.perf_counter() - t0, 4)
+                sha, gid = sha256(a.genome), os.path.basename(a.genome)
+                guides = read_guides_any(a.guides, a.parser) if a.guides else make_guides(genome, a.n_guides, a.seed)
+                gset = os.path.basename(a.guides) if a.guides else f"random-{len(guides)}"
+            else:
+                chroms = [c.strip() for c in a.chroms.split(",")] if a.chroms else None
+                debug_log(f"generating mock genome scale={a.scale} chromosomes={chroms or 'default'}")
+                mock = generate_mock(scale=a.scale, chroms=chroms, seed=a.seed, n_guides=a.n_guides)
+                genome = {c: ba.decode() for c, ba in mock["genome"].items()}
+                guides, truth, gid, gset = mock["guides"], mock["truth"], "G-mock", "S-mock"
+            total = sum(len(x) for x in genome.values())
+            debug_log(f"loaded {len(genome)} contigs, {total:,} bp, {len(guides)} guides"
+                      + (f" in {load_s:.4f}s" if load_s is not None else ""))
+            if a.impl == "oracle" and total > 400_000 and not a.force:
+                print(f"ERROR: the naive oracle on {total:,} bp is very slow; use a smaller genome or add --force.")
+                return 2
+            rec = run_baseline(genome, guides, a.config, a.impl, a.runs, a.warmup, gid, gset, truth, load_s, sha)
+            debug_log(f"search complete: {rec['total_hits']} hits; saving record under {a.out_dir}")
+            saved = save_baseline(rec, a.out_dir)
+            print(format_baseline(rec, saved))
+            return 0
+        except (ValueError, RuntimeError, OSError) as e:
+            print("ERROR:", e)
+            return 2
     if a.command == "rules":
         if a.out:
             _write(a.out, rules_markdown())
@@ -1244,31 +1566,6 @@ def main(argv=None):
             print("kept    ", os.path.join(a.dir, "m.json"), "(already exists; not overwritten)")
         print(f"next: put FASTA files in {os.path.join(a.dir, 'data')} and edit {os.path.join(a.dir, 'm.json')}")
         return 0
-    if a.command == "baseline":
-        try:
-            genome = read_genome(a.path, a.parser)
-            guides = read_guides_any(a.guides, a.parser)
-            record = pure_python_baseline(genome, guides, CONFIGS[a.config],
-                                          warmup_runs=a.warmup, timed_runs=a.runs)
-            print(f"tool        : {record['tool']}")
-            print(f"config      : {a.config}")
-            print(f"genome      : {record['genome_bp']:,} bp")
-            print(f"guides      : {record['guide_count']:,}")
-            print(f"timings     : {[round(t, 6) for t in record['raw_timing_seconds']]}")
-            print(f"median      : {record['median_search_seconds']:.6f} seconds")
-            print(f"throughput  : {record['guide_positions_per_second']:.2f} guide-positions/second")
-            print(f"hits        : {record['hits']:,}")
-            print(f"hit speed   : {record['hits_per_second']:.2f} hits/second")
-            if a.out:
-                record["config"] = a.config
-                record["genome_path"] = a.path
-                record["guides_path"] = a.guides
-                _write(a.out, json.dumps(record, indent=2) + "\n")
-                print(f"record      : {a.out}")
-            return 0
-        except (ValueError, RuntimeError, OSError) as e:
-            print("ERROR:", e)
-            return 2
     if a.scale <= 0:
         ap.error("--scale must be greater than zero")
     try:
@@ -1279,4 +1576,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    print("Loading configuration....")
+    print("Done loading configuration")
     sys.exit(main())

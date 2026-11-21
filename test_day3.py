@@ -7,6 +7,7 @@ Tests marked 'Biopython' are skipped (not failed) when Biopython is not installe
     pip install biopython
 """
 import contextlib, gzip, io, os, tempfile, unittest
+from unittest.mock import patch
 
 import fasta as f
 
@@ -76,10 +77,9 @@ class Day3FormatAndGenome(TmpCase):
             f.read_genome(self.path("g.fa", GENOME), parser="nope")
 
     def test_bio_parser_without_biopython_says_how_to_install(self):
-        if f.HAVE_BIOPYTHON:
-            self.skipTest("Biopython is installed")
-        with self.assertRaises(RuntimeError) as cm:
-            f.read_genome(self.path("g.fa", GENOME), parser="bio")
+        with patch.object(f, "HAVE_BIOPYTHON", False):
+            with self.assertRaises(RuntimeError) as cm:
+                f.read_genome(self.path("g.fa", GENOME), parser="bio")
         self.assertIn("pip install biopython", str(cm.exception))
 
 
