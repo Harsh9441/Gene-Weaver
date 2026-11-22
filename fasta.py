@@ -8,6 +8,7 @@
   python fasta.py chunks genome.fa --chunk-size 1000000 --config C4 [--guides g.fa --verify]   # Day 4
   python fasta.py animate [--delay 0.45] [--plain]                                           # Day 4 animation
   python fasta.py baseline [--config C2] [--runs 5]                                          # Day 5: timed pure-Python baseline
+  python fasta.py gpu [--backend auto|gpu|emulated] [--config C2] [--verify]                # Day 6: CUDA kernel
   python fasta.py --debug baseline [--runs 5]                                                # verbose diagnostics
   python fasta.py baseline --debug [--runs 5]                                                # same, flag after command
   GENEWEAVER_DEBUG=1 python fasta.py selftest                                                # enable diagnostics via environment
@@ -1178,6 +1179,428 @@ def save_baseline(rec, out_dir):
 
 
 # ======================================================================
+# DAY 6 - First CUDA mismatch kernel and chunked search
+# ======================================================================
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+_emulated_thread_index = 0
+
+try:
+    from numba import cuda
+    HAVE_NUMBA = True
+except ImportError:
+    HAVE_NUMBA = False
+
+    _emulated_thread_index = 0
+
+    class _NoNumbaKernel:
+        def __init__(self, fn):
+            self.py_func = fn
+
+        def __getitem__(self, _):
+            raise RuntimeError("Numba is required to launch a CUDA kernel")
+
+    class _NoNumbaCuda:
+        def jit(self, fn=None, **kwargs):
+            def decorate(func):
+                return _NoNumbaKernel(func)
+            return decorate(fn) if fn is not None else decorate
+
+        def grid(self, ndim):
+            if ndim != 1:
+                raise ValueError("the emulator supports one-dimensional grids")
+            return _emulated_thread_index
+
+        def is_available(self):
+            return False
+
+    cuda = _NoNumbaCuda()
+
+
+class _EmulatedCuda:
+    def grid(self, ndim):
+        if ndim != 1:
+            raise ValueError("the emulator supports one-dimensional grids")
+        return _emulated_thread_index
+
+
+@cuda.jit
+def mismatch_kernel(codes, guides, glen, masks, mm, out):
+    i = cuda.grid(1)
+    n_pos = len(codes) - glen - len(masks) + 1
+    if i < n_pos:
+        valid = True
+        for k in range(len(masks)):
+            base = codes[i + glen + k]
+            if base > 3 or (masks[k] & (1 << base)) == 0:
+                valid = False
+                break
+        if valid:
+            for g in range(len(guides)):
+                distance = 0
+                for j in range(glen):
+                    if codes[i + j] != guides[g, j]:
+                        distance += 1
+                if distance <= mm:
+                    out[i, g] = distance
+
+
+def _require_numpy():
+    if np is None:
+        raise RuntimeError("Day 6 requires NumPy; install it with: python -m pip install numpy")
+
+
+def encode_bases(sequence):
+    _require_numpy()
+    return np.fromiter(({"A": 0, "C": 1, "G": 2, "T": 3}.get(b.upper(), 4) for b in sequence),
+                       dtype=np.uint8, count=len(sequence))
+
+
+def encode_guide(sequence):
+    _require_numpy()
+    sequence = sequence.upper()
+    if not sequence or any(base not in "ACGT" for base in sequence):
+        raise ValueError("guides must contain only A, C, G, and T")
+    return np.fromiter(({"A": 0, "C": 1, "G": 2, "T": 3}[b] for b in sequence),
+                       dtype=np.uint8, count=len(sequence))
+
+
+def pam_masks_for(pam):
+    _require_numpy()
+    try:
+        return np.asarray([sum(1 << "ACGT".index(base) for base in IUPAC[code.upper()])
+                           for code in pam], dtype=np.uint8)
+    except KeyError as e:
+        raise ValueError(f"unsupported IUPAC PAM symbol: {e.args[0]}") from e
+
+
+def revcomp_codes(codes):
+    _require_numpy()
+    table = np.asarray([3, 2, 1, 0, 4], dtype=np.uint8)
+    return table[np.asarray(codes, dtype=np.uint8)[::-1]]
+
+
+def emulate_launch(kernel, blocks, threads, args):
+    if blocks < 0 or threads < 1:
+        raise ValueError("blocks must be non-negative and threads must be positive")
+    global _emulated_thread_index, cuda
+    held_cuda = cuda
+    cuda = _EmulatedCuda()
+    try:
+        body = getattr(kernel, "py_func", kernel)
+        for block in range(blocks):
+            for thread in range(threads):
+                _emulated_thread_index = block * threads + thread
+                body(*args)
+    finally:
+        cuda = held_cuda
+        _emulated_thread_index = 0
+
+
+def gpu_backend(requested="auto"):
+    if requested not in ("auto", "gpu", "emulated"):
+        raise ValueError("backend must be auto, gpu, or emulated")
+    if requested == "emulated":
+        return "emulated"
+    available = False
+    if HAVE_NUMBA:
+        try:
+            available = bool(cuda.is_available())
+        except (AttributeError, OSError, RuntimeError):
+            available = False
+    if available:
+        return "gpu"
+    if requested == "gpu":
+        raise RuntimeError("no usable CUDA GPU is available (install Numba and check the CUDA driver)")
+    return "emulated"
+
+
+def gpu_info(backend):
+    info = {"backend": backend, "device": None, "compute_capability": None,
+            "simulator": os.environ.get("NUMBA_ENABLE_CUDASIM", "").strip() == "1"}
+    if backend == "gpu":
+        if info["simulator"]:
+            info["device"] = "Numba CUDA simulator"
+        else:
+            device = cuda.get_current_device()
+            name = device.name
+            info["device"] = name.decode() if isinstance(name, bytes) else str(name)
+            capability = getattr(device, "compute_capability", None)
+            if capability:
+                info["compute_capability"] = f"{capability[0]}.{capability[1]}"
+    return info
+
+
+def scan_codes(codes, guides, glen, masks, mm, backend="auto", threads=128):
+    _require_numpy()
+    if not isinstance(mm, int) or not 0 <= mm <= 254:
+        raise ValueError("mismatch budget must be between 0 and 254")
+    if threads < 1:
+        raise ValueError("threads must be positive")
+    codes = np.asarray(codes, dtype=np.uint8)
+    guides = np.asarray(guides, dtype=np.uint8)
+    masks = np.asarray(masks, dtype=np.uint8)
+    if codes.ndim != 1 or guides.ndim != 2 or masks.ndim != 1:
+        raise ValueError("codes and masks must be 1-D and guides must be 2-D")
+    if guides.shape[1] != glen or glen < 1 or len(masks) < 1:
+        raise ValueError("guide length and PAM masks must be non-empty and match")
+    selected = gpu_backend(backend)
+    n_pos = max(0, len(codes) - glen - len(masks) + 1)
+    out = np.full((n_pos, len(guides)), 255, dtype=np.uint8)
+    if n_pos == 0 or len(guides) == 0:
+        return out
+    blocks = (n_pos + threads - 1) // threads
+    args = (codes, guides, glen, masks, mm, out)
+    if selected == "gpu":
+        mismatch_kernel[blocks, threads](*args)
+    else:
+        emulate_launch(mismatch_kernel, blocks, threads, args)
+    return out
+
+
+def auto_chunk_size(genome_bp):
+    if genome_bp <= 0:
+        return 1_000_000
+    return max(10_000, min(1_000_000, 100_000_000 // genome_bp))
+
+
+def _decode_codes(codes):
+    alphabet = "ACGTN"
+    return "".join(alphabet[int(base)] for base in codes)
+
+
+def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128, progress=None):
+    _require_numpy()
+    if isinstance(cfg, str):
+        cfg = CONFIGS[cfg]
+    if cfg["db"] or cfg["rb"]:
+        raise ValueError("the CUDA kernel supports mismatch-only configurations")
+    if not guides:
+        return []
+    selected = gpu_backend(backend)
+    if chunk_size is None:
+        chunk_size = auto_chunk_size(sum(len(seq) for seq in genome.values()))
+    if chunk_size < 1:
+        raise ValueError("chunk size must be positive")
+    if threads < 1:
+        raise ValueError("threads must be positive")
+
+    guides_by_len = {}
+    for guide_id, sequence in guides:
+        encoded = encode_guide(sequence)
+        guides_by_len.setdefault(len(sequence), []).append((guide_id, encoded))
+    encoded_guides = {
+        length: np.stack([entry[1] for entry in entries]).astype(np.uint8, copy=False)
+        for length, entries in guides_by_len.items()
+    }
+    masks = pam_masks_for(cfg["pam"])
+    overlap = required_overlap(cfg, max(guides_by_len))
+    chunk_plans = [(chrom, seq, plan_chunks(len(seq), chunk_size, overlap))
+                   for chrom, seq in genome.items()]
+    total_chunks = sum(len(plan) for _, _, plan in chunk_plans)
+    completed = 0
+    started = time.perf_counter()
+    hits = []
+
+    for chrom, seq, plan in chunk_plans:
+        codes = encode_bases(seq)
+        for own_start, own_end, read_start, read_end in plan:
+            forward = codes[read_start:read_end]
+            for strand, oriented in (("+", forward), ("-", revcomp_codes(forward))):
+                for glen, entries in guides_by_len.items():
+                    result = scan_codes(oriented, encoded_guides[glen], glen, masks, cfg["mm"],
+                                        selected, threads)
+                    for pos in range(result.shape[0]):
+                        forward_start = (read_start + pos if strand == "+"
+                                         else read_end - (pos + glen + len(masks)))
+                        if not own_start <= forward_start < own_end:
+                            continue
+                        target = _decode_codes(oriented[pos:pos + glen + len(masks)])
+                        for guide_index, (guide_id, _) in enumerate(entries):
+                            distance = int(result[pos, guide_index])
+                            if distance != 255:
+                                hits.append(Hit(guide_id, chrom, forward_start, strand, distance, 0, 0, target))
+            completed += 1
+            if progress is not None:
+                progress(completed, total_chunks, len(hits), time.perf_counter() - started)
+    return normalize(hits)
+
+
+def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None,
+            chunk_size=None, threads=128, genome_id="G-mock", guide_set="S-mock",
+            genome_sha=None, progress=None):
+    if runs < 1 or warmup < 0:
+        raise ValueError("need runs >= 1 and warmup >= 0")
+    cfg = CONFIGS[config] if isinstance(config, str) else config
+    selected = gpu_backend(backend)
+    n_bp = sum(len(seq) for seq in genome.values())
+    if chunk_size is None:
+        chunk_size = auto_chunk_size(n_bp)
+    search = lambda: gpu_search(genome, guides, cfg, chunk_size, selected, threads)
+    for _ in range(warmup):
+        search()
+    times, hits = [], None
+    for index in range(runs):
+        t0 = time.perf_counter()
+        hits = gpu_search(genome, guides, cfg, chunk_size, selected, threads,
+                          progress if index == runs - 1 else None)
+        times.append(time.perf_counter() - t0)
+
+    baseline_hits = packed_search(genome, guides, cfg)
+    correctness = {
+        "matches_baseline": hits == baseline_hits,
+        "note": "identical to the Day 5 pure-Python baseline" if hits == baseline_hits
+                else "DIFFERS from the Day 5 pure-Python baseline",
+        "planted_total": None,
+        "planted_found": None,
+    }
+    if truth is not None:
+        found = {hit.key() for hit in hits}
+        planted = [row for row in truth if row[5] == 0 and row[6] == 0 and row[4] <= cfg["mm"]]
+        correctness.update(planted_total=len(planted),
+                           planted_found=sum((row[0], row[1], row[2], row[3]) in found for row in planted))
+    stats = summarize_times(times)
+    rec = dict(
+        tool="geneweaver-cuda",
+        implementation=f"cuda-{selected}",
+        backend=selected,
+        rules_version=RULES_VERSION,
+        created=datetime.datetime.now().isoformat(timespec="seconds"),
+        genome=genome_id,
+        genome_sha256=genome_sha or genome_digest(genome),
+        genome_bp=n_bp,
+        guide_set=guide_set,
+        n_guides=len(guides),
+        config=config if isinstance(config, str) else "custom",
+        config_detail=cfg,
+        runs_s=[round(seconds, 6) for seconds in times],
+        median_search_s=stats["median"],
+        iqr_s=[stats["q1"], stats["q3"]],
+        unstable=stats["unstable"],
+        gps=gps(len(guides), n_bp, stats["median"]) if stats["median"] else None,
+        total_hits=len(hits),
+        gpu=gpu_info(selected),
+        threads_per_block=threads,
+        chunk_size=chunk_size,
+        hardware=hardware_info(),
+        correctness=correctness,
+    )
+    return rec, hits
+
+
+def save_gpu(rec, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    name = (f"baseline_{rec['genome']}_{rec['genome_sha256'][:8]}_{rec['guide_set']}_{rec['config']}_"
+            f"{rec['implementation']}.json").replace(os.sep, "_")
+    path = os.path.join(out_dir, name)
+    with open(path, "w") as fh:
+        json.dump(rec, fh, indent=2)
+    line = {key: rec[key] for key in ("created", "implementation", "genome", "genome_bp", "guide_set",
+                                      "n_guides", "config", "median_search_s", "gps", "total_hits")}
+    with open(os.path.join(out_dir, "baseline_log.jsonl"), "a") as fh:
+        fh.write(json.dumps(line) + "\n")
+    return path
+
+
+def format_progress(completed, total, hits, elapsed):
+    pct = 100 if total == 0 else min(100, int(completed * 100 / total))
+    filled = 30 if total == 0 else min(30, int(completed * 30 / total))
+    bar = "=" * filled + " " * (30 - filled)
+    return (f"[{bar}] {pct:3d}%  chunk {completed}/{total}  hits {hits}  "
+            f"{elapsed:.1f}s")
+
+
+class ProgressView:
+    def __init__(self, out=None, tty=None):
+        self.out = out or sys.stdout
+        self.tty = self.out.isatty() if tty is None else tty
+        self._last_step = 0
+
+    def __call__(self, completed, total, hits, elapsed):
+        line = format_progress(completed, total, hits, elapsed)
+        if self.tty:
+            self.out.write("\r" + line)
+            if completed >= total:
+                self.out.write("\n")
+            self.out.flush()
+            return
+        step = max(1, total // 5)
+        if completed >= total or completed // step > self._last_step:
+            self.out.write(line + "\n")
+            self.out.flush()
+            self._last_step = completed // step
+
+
+def format_gpu(rec, saved=None):
+    gpu = rec["gpu"]
+    backend = rec.get("backend", gpu.get("backend"))
+    if backend == "emulated":
+        device = "CPU emulation"
+    elif gpu.get("simulator"):
+        device = "Numba simulator"
+    else:
+        device = f"NVIDIA GPU: {gpu.get('device')}"
+    chk = rec["correctness"]
+    baseline = ("identical to the Day 5 pure-Python baseline"
+                if chk.get("matches_baseline") else "DIFFERS from the Day 5 pure-Python baseline")
+    lines = [
+        f"backend     : {backend} ({device})",
+        f"kernel      : mismatch_kernel, {rec['threads_per_block']} threads/block",
+        f"genome      : {rec['genome']}  {rec['genome_bp']:,} bp   guides: {rec['n_guides']}   config {rec['config']}",
+        f"runs (s)    : " + "  ".join(f"{seconds:.3f}" for seconds in rec["runs_s"]),
+        f"median      : {rec['median_search_s']:.3f} s",
+        f"throughput  : {rec['gps']:.3e} guide-positions/s" if rec["gps"] is not None else "throughput  : n/a",
+        f"hits        : {rec['total_hits']}",
+        f"baseline    : {baseline}",
+    ]
+    if chk.get("planted_total") is not None:
+        lines.append(f"check       : planted sites found {chk['planted_found']}/{chk['planted_total']}")
+    if saved:
+        lines.append(f"saved       : {saved}")
+    return "\n".join(lines)
+
+
+def cmd_gpu(a):
+    try:
+        cfg = CONFIGS[a.config]
+        if cfg["db"] or cfg["rb"]:
+            print(f"ERROR: {a.config} has bulges; the CUDA kernel is mismatch-only.")
+            return 2
+        selected = gpu_backend(a.backend)
+        truth, load_s, genome_sha = None, None, None
+        if a.genome:
+            t0 = time.perf_counter()
+            genome = read_genome(a.genome, a.parser)
+            load_s = round(time.perf_counter() - t0, 4)
+            genome_sha = sha256(a.genome)
+            genome_id = os.path.basename(a.genome)
+            guides = read_guides_any(a.guides, a.parser) if a.guides else make_guides(genome, a.n_guides, a.seed)
+            guide_set = os.path.basename(a.guides) if a.guides else f"random-{len(guides)}"
+        else:
+            chroms = [name.strip() for name in a.chroms.split(",") if name.strip()] or None
+            mock = generate_mock(scale=a.scale, chroms=chroms, seed=a.seed, n_guides=a.n_guides)
+            genome = {name: seq.decode() for name, seq in mock["genome"].items()}
+            guides, truth = mock["guides"], mock["truth"]
+            genome_id, guide_set = "G-mock", "S-mock"
+        view = ProgressView()
+        print("Day 6 - first CUDA kernel")
+        rec, _ = run_gpu(genome, guides, a.config, selected, a.runs, a.warmup, truth,
+                         a.chunk_size, a.threads, genome_id, guide_set, genome_sha, view)
+        saved = save_gpu(rec, a.out_dir)
+        print(format_gpu(rec, saved))
+        if a.verify and (not rec["correctness"]["matches_baseline"]
+                         or (truth is not None and rec["correctness"]["planted_found"] != rec["correctness"]["planted_total"])):
+            return 1
+        return 0
+    except (ValueError, RuntimeError, OSError) as e:
+        print("ERROR:", e)
+        return 2
+
+
+# ======================================================================
 # WEEK 1 TESTS AND COMMAND LINE (Day 1 rules/setup + Day 2 mock genome)
 # ======================================================================
 import argparse, gzip, sys, tempfile
@@ -1444,6 +1867,22 @@ def main(argv=None):
     b.add_argument("--n-guides", type=int, default=10); b.add_argument("--seed", type=int, default=SEED)
     b.add_argument("--out-dir", default="results"); b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     b.add_argument("--force", action="store_true", help="allow the slow oracle on a large genome")
+    g = sub.add_parser("gpu", help="Day 6: run the CUDA mismatch kernel (or its CPU emulator)")
+    g.add_argument("-d", "--debug", action="store_true", default=argparse.SUPPRESS,
+                   help="print diagnostic details to stderr")
+    g.add_argument("--genome", help="genome FASTA; if omitted a mock genome is generated")
+    g.add_argument("--guides", help="guide FASTA/TSV; if omitted guides are generated")
+    g.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+    g.add_argument("--backend", default="auto", choices=["auto", "gpu", "emulated"])
+    g.add_argument("--threads", type=int, default=128, help="CUDA threads per block")
+    g.add_argument("--chunk-size", type=int, help="bases per chunk (chosen automatically by default)")
+    g.add_argument("--runs", type=int, default=5); g.add_argument("--warmup", type=int, default=1)
+    g.add_argument("--scale", type=float, default=0.0001, help="mock genome size as a fraction of GRCh38")
+    g.add_argument("--chroms", default="chr21,chr22")
+    g.add_argument("--n-guides", type=int, default=10); g.add_argument("--seed", type=int, default=SEED)
+    g.add_argument("--out-dir", default="results")
+    g.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+    g.add_argument("--verify", action="store_true", help="check results against the Day 5 baseline and planted sites")
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -1551,6 +1990,9 @@ def main(argv=None):
         except (ValueError, RuntimeError, OSError) as e:
             print("ERROR:", e)
             return 2
+    if a.command == "gpu":
+        debug_log(f"GPU config={a.config} backend={a.backend} runs={a.runs} warmup={a.warmup}")
+        return cmd_gpu(a)
     if a.command == "rules":
         if a.out:
             _write(a.out, rules_markdown())
