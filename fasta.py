@@ -1353,11 +1353,15 @@ def scan_codes(codes, guides, glen, masks, mm, backend="auto", threads=128):
     if n_pos == 0 or len(guides) == 0:
         return out
     blocks = (n_pos + threads - 1) // threads
-    args = (codes, guides, glen, masks, mm, out)
     if selected == "gpu":
-        mismatch_kernel[blocks, threads](*args)
+        device_codes = host_to_device(codes)
+        device_guides = host_to_device(guides)
+        device_masks = host_to_device(masks)
+        device_out = host_to_device(out)
+        mismatch_kernel[blocks, threads](device_codes, device_guides, glen, device_masks, mm, device_out)
+        return device_to_host(device_out)
     else:
-        emulate_launch(mismatch_kernel, blocks, threads, args)
+        emulate_launch(mismatch_kernel, blocks, threads, (codes, guides, glen, masks, mm, out))
     return out
 
 
@@ -1372,7 +1376,32 @@ def _decode_codes(codes):
     return "".join(alphabet[int(base)] for base in codes)
 
 
+# ======================================================================
+# DAY 7 - Explicit host/device memory transfers
+# ======================================================================
+def host_to_device(host_array, stream=0):
+    """Copy a contiguous NumPy array from host memory to a CUDA device."""
+    _require_numpy()
+    if not HAVE_NUMBA:
+        raise RuntimeError("host/device transfers require Numba CUDA")
+    host_array = np.asarray(host_array)
+    if host_array.dtype.hasobject:
+        raise TypeError("host arrays must have a fixed-size dtype")
+    return cuda.to_device(np.ascontiguousarray(host_array), stream=stream)
+
+
+def device_to_host(device_array, stream=0):
+    """Copy a Numba CUDA device array to host memory."""
+    if not HAVE_NUMBA:
+        raise RuntimeError("host/device transfers require Numba CUDA")
+    copy_to_host = getattr(device_array, "copy_to_host", None)
+    if not callable(copy_to_host):
+        raise TypeError("device_array must provide copy_to_host()")
+    return copy_to_host(stream=stream)
+
+
 def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128, progress=None):
+    """Search all guides on both strands, batching guides with the same length."""
     _require_numpy()
     if isinstance(cfg, str):
         cfg = CONFIGS[cfg]
@@ -1827,9 +1856,12 @@ def cmd_mockgenome(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="GeneWeaver Week 1: Day 1 setup + benchmark rules, Day 2 mock human genome generator")
+    ap = argparse.ArgumentParser(
+        description="GeneWeaver Week 1: Day 1 setup + benchmark rules, Day 2 mock human genome generator",
+        epilog="Runs the self-test when no command is supplied.",
+    )
     ap.add_argument("-d", "--debug", action="store_true", help="print diagnostic details to stderr")
-    sub = ap.add_subparsers(dest="command", required=True)
+    sub = ap.add_subparsers(dest="command")
     sub.add_parser("selftest", aliases=["test"], help="run all Day 1 and Day 2 tests")
     r = sub.add_parser("rules", help="Day 1: print the benchmark rules (or write them to a file)")
     r.add_argument("--out", help="write the rules to this Markdown file instead of printing")
@@ -1867,7 +1899,7 @@ def main(argv=None):
     b.add_argument("--n-guides", type=int, default=10); b.add_argument("--seed", type=int, default=SEED)
     b.add_argument("--out-dir", default="results"); b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     b.add_argument("--force", action="store_true", help="allow the slow oracle on a large genome")
-    g = sub.add_parser("gpu", help="Day 6: run the CUDA mismatch kernel (or its CPU emulator)")
+    g = sub.add_parser("gpu", help="Day 6/8: multi-guide search on both strands (CUDA or CPU emulator)")
     g.add_argument("-d", "--debug", action="store_true", default=argparse.SUPPRESS,
                    help="print diagnostic details to stderr")
     g.add_argument("--genome", help="genome FASTA; if omitted a mock genome is generated")
@@ -1892,6 +1924,8 @@ def main(argv=None):
     m.add_argument("--verify", action="store_true", help="fast check of every planted site")
     m.add_argument("--verify-oracle", action="store_true", help="full CPU search (small genomes only)")
     a = ap.parse_args(argv)
+    if a.command is None:
+        a.command = "selftest"
     debug_env = os.environ.get("GENEWEAVER_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
     debug = a.debug or debug_env
 
