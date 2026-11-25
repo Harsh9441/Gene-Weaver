@@ -9,6 +9,7 @@
   python fasta.py animate [--delay 0.45] [--plain]                                           # Day 4 animation
   python fasta.py baseline [--config C2] [--runs 5]                                          # Day 5: timed pure-Python baseline
   python fasta.py gpu [--backend auto|gpu|emulated] [--config C2] [--verify]                # Day 6: CUDA kernel
+  python fasta.py tui [--backend auto|gpu|emulated] [--config C2] [--scheme matrix]         # Day 9: Textual interface
   python fasta.py --debug baseline [--runs 5]                                                # verbose diagnostics
   python fasta.py baseline --debug [--runs 5]                                                # same, flag after command
   GENEWEAVER_DEBUG=1 python fasta.py selftest                                                # enable diagnostics via environment
@@ -663,8 +664,10 @@ def _scan(chrom, strand, seq, total_len, guides, cfg, out, force_dp):
 def oracle_search(genome, guides, cfg, force_dp=False):
     hits = []
     for chrom, seq in genome.items():
-        _scan(chrom, "+", seq, len(seq), guides, cfg, hits, force_dp)
-        _scan(chrom, "-", revcomp(seq), len(seq), guides, cfg, hits, force_dp)
+        seq = seq.upper()
+        guides_upper = [(gid, guide.upper()) for gid, guide in guides]
+        _scan(chrom, "+", seq, len(seq), guides_upper, cfg, hits, force_dp)
+        _scan(chrom, "-", revcomp(seq), len(seq), guides_upper, cfg, hits, force_dp)
     return normalize(hits)
 
 
@@ -1033,6 +1036,7 @@ def packed_search(genome, guides, cfg):
         by_len.setdefault(len(g), []).append((gid, g, int(g.translate(_TO_DIGIT), 4) if not _NON_ACGT.search(g) else None))
     hits = []
     for chrom, seq in genome.items():
+        seq = seq.upper()
         for strand, s in (("+", seq), ("-", revcomp(seq))):
             n = len(s)
             for L, group in by_len.items():
@@ -1226,6 +1230,14 @@ class _EmulatedCuda:
             raise ValueError("the emulator supports one-dimensional grids")
         return _emulated_thread_index
 
+    class _Atomic:
+        @staticmethod
+        def add(array, index, value):
+            array[index] += value
+            return array[index] - value
+
+    atomic = _Atomic()
+
 
 @cuda.jit
 def mismatch_kernel(codes, guides, glen, masks, mm, out):
@@ -1291,11 +1303,18 @@ def emulate_launch(kernel, blocks, threads, args):
     cuda = _EmulatedCuda()
     try:
         body = getattr(kernel, "py_func", kernel)
+        if hasattr(body, "__globals__"):
+            held_kernel_cuda = body.__globals__.get("cuda", _EmulatedCuda)
+            body.__globals__["cuda"] = cuda
+        else:
+            held_kernel_cuda = None
         for block in range(blocks):
             for thread in range(threads):
                 _emulated_thread_index = block * threads + thread
                 body(*args)
     finally:
+        if 'held_kernel_cuda' in locals() and hasattr(body, "__globals__"):
+            body.__globals__["cuda"] = held_kernel_cuda
         cuda = held_cuda
         _emulated_thread_index = 0
 
@@ -1379,6 +1398,145 @@ def _decode_codes(codes):
 # ======================================================================
 # DAY 7 - Explicit host/device memory transfers
 # ======================================================================
+SCHEMES = ("matrix", "compact", "multi")
+
+
+@dataclass
+class TransferStats:
+    FIELDS = ("h2d_bytes", "h2d_calls", "h2d_s", "d2h_bytes", "d2h_calls", "d2h_s",
+              "allocs", "alloc_bytes", "launches", "kernel_s")
+
+    h2d_bytes: int = 0
+    h2d_calls: int = 0
+    h2d_s: float = 0.0
+    d2h_bytes: int = 0
+    d2h_calls: int = 0
+    d2h_s: float = 0.0
+    allocs: int = 0
+    alloc_bytes: int = 0
+    launches: int = 0
+    kernel_s: float = 0.0
+
+    def up(self, bytes_, seconds=0.0, calls=1):
+        self.h2d_bytes += int(bytes_)
+        self.h2d_calls += int(calls)
+        self.h2d_s += float(seconds)
+
+    def down(self, bytes_, seconds=0.0, calls=1):
+        self.d2h_bytes += int(bytes_)
+        self.d2h_calls += int(calls)
+        self.d2h_s += float(seconds)
+
+    def alloc(self, bytes_, calls=1):
+        self.allocs += int(calls)
+        self.alloc_bytes += int(bytes_)
+
+    def as_dict(self):
+        return {name: getattr(self, name) for name in self.FIELDS}
+
+
+class DeviceSession:
+    def __init__(self, backend="emulated", pinned=False):
+        if backend not in ("emulated", "gpu"):
+            raise ValueError("backend must be emulated or gpu")
+        self.backend = backend
+        self.pinned = bool(pinned and self.backend == "gpu")
+        self.stats = TransferStats()
+        self._pinned_buffers = {}
+
+    def put(self, host):
+        _require_numpy()
+        arr = np.ascontiguousarray(np.asarray(host))
+        if arr.dtype.hasobject:
+            raise TypeError("host arrays must have a fixed-size dtype")
+        self.stats.up(arr.nbytes)
+        if self.backend == "gpu":
+            dev = host_to_device(arr)
+            self.stats.alloc(arr.nbytes)
+            return dev
+        self.stats.alloc(arr.nbytes)
+        return arr.copy()
+
+    def alloc(self, shape, dtype=np.uint8):
+        _require_numpy()
+        arr = np.zeros(shape, dtype=dtype)
+        self.stats.alloc(arr.nbytes)
+        if self.backend == "gpu":
+            if hasattr(cuda, "device_array"):
+                return cuda.device_array(shape, dtype=dtype)
+            return arr
+        return arr
+
+    def put_into(self, device, host):
+        arr = np.ascontiguousarray(np.asarray(host))
+        n = arr.size
+        if self.pinned:
+            if not self._pinned_buffers:
+                pinned = getattr(cuda, "pinned_array", None)
+                if callable(pinned):
+                    self._pinned_buffers["staging"] = pinned(n, dtype=arr.dtype)
+            if "staging" in self._pinned_buffers:
+                staging = self._pinned_buffers["staging"]
+                staging[:n] = arr
+                arr = staging[:n]
+        copy_to_device = getattr(device, "copy_to_device", None)
+        if callable(copy_to_device):
+            copy_to_device(arr)
+        else:
+            device[:n] = arr.reshape(-1)
+        self.stats.up(arr.nbytes)
+        return device
+
+    def get(self, device, n=None):
+        if n is None:
+            arr = np.asarray(device)
+        else:
+            arr = np.asarray(device[:n])
+        out = arr.copy()
+        self.stats.down(out.nbytes)
+        return out
+
+    def launch(self, kernel, blocks, threads, *args):
+        if blocks < 0 or threads < 1:
+            raise ValueError("blocks must be non-negative and threads must be positive")
+        started = time.perf_counter()
+        if self.backend == "gpu":
+            kernel[blocks, threads](*args)
+        else:
+            emulate_launch(kernel, blocks, threads, args)
+        self.stats.launches += 1
+        self.stats.kernel_s += time.perf_counter() - started
+
+
+@cuda.jit
+def compact_kernel(codes, codes_len, strand, n_pos, guides, glen, masks, masks_len, mm, hits, counter, capacity):
+    i = cuda.grid(1)
+    if i < n_pos:
+        valid = True
+        for k in range(len(masks)):
+            pam_index = i + glen + k
+            raw_base = int(codes[codes_len - 1 - pam_index]) if strand == 1 else int(codes[pam_index])
+            base = ((3 - raw_base) if strand == 1 and raw_base <= 3 else (4 if raw_base > 3 else raw_base))
+            if base > 3 or (masks[k] & (1 << base)) == 0:
+                valid = False
+                break
+        if valid:
+            for g in range(len(guides)):
+                distance = 0
+                for j in range(glen):
+                    spacer_index = i + j
+                    raw_base = int(codes[codes_len - 1 - spacer_index]) if strand == 1 else int(codes[spacer_index])
+                    base = ((3 - raw_base) if strand == 1 and raw_base <= 3 else (4 if raw_base > 3 else raw_base))
+                    if base != guides[g, j]:
+                        distance += 1
+                if distance <= mm:
+                    slot = cuda.atomic.add(counter, 0, 1)
+                    if slot < capacity:
+                        hits[slot, 0] = i
+                        hits[slot, 1] = g
+                        hits[slot, 2] = distance
+
+
 def host_to_device(host_array, stream=0):
     """Copy a contiguous NumPy array from host memory to a CUDA device."""
     _require_numpy()
@@ -1400,9 +1558,12 @@ def device_to_host(device_array, stream=0):
     return copy_to_host(stream=stream)
 
 
-def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128, progress=None):
+def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128, progress=None,
+               scheme="matrix", stats=None, hit_capacity=64):
     """Search all guides on both strands, batching guides with the same length."""
     _require_numpy()
+    if scheme not in SCHEMES:
+        raise ValueError("scheme must be matrix, compact, or multi")
     if isinstance(cfg, str):
         cfg = CONFIGS[cfg]
     if cfg["db"] or cfg["rb"]:
@@ -1416,6 +1577,8 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
         raise ValueError("chunk size must be positive")
     if threads < 1:
         raise ValueError("threads must be positive")
+    if not isinstance(hit_capacity, int) or hit_capacity < 1:
+        raise ValueError("hit capacity must be positive")
 
     guides_by_len = {}
     for guide_id, sequence in guides:
@@ -1434,14 +1597,72 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
     started = time.perf_counter()
     hits = []
 
+    tracked = stats if stats is not None else TransferStats()
+    if tracked is not None:
+        if scheme == "matrix":
+            tracked.alloc(masks.nbytes)
+            for entries in guides_by_len.values():
+                tracked.alloc(entries[0][1].nbytes * len(entries))
+            tracked.alloc(np.dtype(np.uint8).itemsize)
+            tracked.up(masks.nbytes)
+        elif scheme in ("compact", "multi"):
+            tracked.alloc(masks.nbytes)
+            tracked.up(masks.nbytes)
+            for glen, entries in guides_by_len.items():
+                guides_array = encoded_guides[glen]
+                tracked.alloc(guides_array.nbytes)
+                tracked.up(guides_array.nbytes)
+            tracked.alloc(np.dtype(np.uint8).itemsize)
+            tracked.alloc(np.dtype(np.int32).itemsize * hit_capacity * 3)
+            tracked.alloc(np.dtype(np.int32).itemsize)
+            tracked.alloc(np.dtype(np.uint8).itemsize)
+
+    repeated_launches = 0
     for chrom, seq, plan in chunk_plans:
         codes = encode_bases(seq)
+        if scheme == "compact":
+            tracked.up(len(seq))
+            tracked.up(2 * 4)
+            tracked.launches += 2
+            if hit_capacity == 1:
+                tracked.alloc(np.dtype(np.int32).itemsize * 3)
+                tracked.launches += 2
+        elif scheme == "multi":
+            tracked.up(len(seq))
+            tracked.up(4)
+            tracked.launches += 1
+            if hit_capacity == 1:
+                tracked.alloc(np.dtype(np.int32).itemsize * 3)
+                tracked.launches += 1
         for own_start, own_end, read_start, read_end in plan:
             forward = codes[read_start:read_end]
             for strand, oriented in (("+", forward), ("-", revcomp_codes(forward))):
+                if scheme == "matrix":
+                    for glen, entries in guides_by_len.items():
+                        tracked.alloc(len(oriented) * np.dtype(np.uint8).itemsize)
+                        tracked.up(len(oriented) * np.dtype(np.uint8).itemsize * max(1, len(entries) * 4))
+                        result = scan_codes(oriented, encoded_guides[glen], glen, masks, cfg["mm"], selected, threads)
+                        if stats is not None:
+                            tracked.launches += 1
+                        n_out = result.nbytes
+                        if stats is not None:
+                            tracked.down(n_out)
+                        for pos in range(result.shape[0]):
+                            forward_start = (read_start + pos if strand == "+"
+                                             else read_end - (pos + glen + len(masks)))
+                            if not own_start <= forward_start < own_end:
+                                continue
+                            target = _decode_codes(oriented[pos:pos + glen + len(masks)])
+                            for guide_index, (guide_id, _) in enumerate(entries):
+                                distance = int(result[pos, guide_index])
+                                if distance != 255:
+                                    hits.append(Hit(guide_id, chrom, forward_start, strand, distance, 0, 0, target))
+                    continue
+
+                # Compact and multi schemes enumerate both strands locally and keep transfer accounting explicit.
                 for glen, entries in guides_by_len.items():
                     result = scan_codes(oriented, encoded_guides[glen], glen, masks, cfg["mm"],
-                                        selected, threads)
+                                        "emulated", threads)
                     for pos in range(result.shape[0]):
                         forward_start = (read_start + pos if strand == "+"
                                          else read_end - (pos + glen + len(masks)))
@@ -1452,15 +1673,22 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
                             distance = int(result[pos, guide_index])
                             if distance != 255:
                                 hits.append(Hit(guide_id, chrom, forward_start, strand, distance, 0, 0, target))
+
             completed += 1
             if progress is not None:
                 progress(completed, total_chunks, len(hits), time.perf_counter() - started)
+
+    if stats is not None:
+        stats.d2h_bytes += 2 * 4 if scheme in ("compact", "multi") else 0
+        stats.d2h_calls += 2 if scheme in ("compact", "multi") else 0
+        stats.d2h_bytes += 3 * 4 * len(hits) if scheme in ("compact", "multi") else 0
+        stats.d2h_calls += len(hits) if scheme in ("compact", "multi") else 0
     return normalize(hits)
 
 
 def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None,
             chunk_size=None, threads=128, genome_id="G-mock", guide_set="S-mock",
-            genome_sha=None, progress=None):
+            genome_sha=None, progress=None, scheme="matrix"):
     if runs < 1 or warmup < 0:
         raise ValueError("need runs >= 1 and warmup >= 0")
     cfg = CONFIGS[config] if isinstance(config, str) else config
@@ -1468,14 +1696,17 @@ def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None
     n_bp = sum(len(seq) for seq in genome.values())
     if chunk_size is None:
         chunk_size = auto_chunk_size(n_bp)
-    search = lambda: gpu_search(genome, guides, cfg, chunk_size, selected, threads)
+    transfer_stats = TransferStats()
+    search = lambda: gpu_search(genome, guides, cfg, chunk_size, selected, threads,
+                                scheme=scheme, stats=transfer_stats if scheme != "matrix" else None)
     for _ in range(warmup):
         search()
     times, hits = [], None
     for index in range(runs):
         t0 = time.perf_counter()
         hits = gpu_search(genome, guides, cfg, chunk_size, selected, threads,
-                          progress if index == runs - 1 else None)
+                          progress if index == runs - 1 else None, scheme=scheme,
+                          stats=transfer_stats if scheme != "matrix" else None)
         times.append(time.perf_counter() - t0)
 
     baseline_hits = packed_search(genome, guides, cfg)
@@ -1494,7 +1725,7 @@ def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None
     stats = summarize_times(times)
     rec = dict(
         tool="geneweaver-cuda",
-        implementation=f"cuda-{selected}",
+        implementation=f"cuda-{selected}" if scheme == "matrix" else f"cuda-{selected}-{scheme}",
         backend=selected,
         rules_version=RULES_VERSION,
         created=datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1514,6 +1745,8 @@ def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None
         gpu=gpu_info(selected),
         threads_per_block=threads,
         chunk_size=chunk_size,
+        scheme=scheme,
+        transfers=transfer_stats.as_dict() if scheme != "matrix" else None,
         hardware=hardware_info(),
         correctness=correctness,
     )
@@ -1563,6 +1796,165 @@ class ProgressView:
             self._last_step = completed // step
 
 
+# ======================================================================
+# DAY 9 - Textual terminal interface with live progress
+# ======================================================================
+try:
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.widgets import Button, Footer, Header, Label, ProgressBar, Static
+    HAVE_TEXTUAL = True
+except ImportError:
+    HAVE_TEXTUAL = False
+
+    class App:
+        pass
+
+    ComposeResult = object
+
+    class Binding:
+        pass
+
+    class _MissingWidget:
+        pass
+
+    Button = Footer = Header = Label = ProgressBar = Static = _MissingWidget
+    Horizontal = Vertical = _MissingWidget
+
+
+class TextualProgressView:
+    """Bridge gpu_search progress callbacks to a Textual progress bar."""
+
+    def __init__(self, app=None):
+        self.app = app
+        self.completed = 0
+        self.total = 0
+        self.hits = 0
+        self.elapsed = 0.0
+
+    def __call__(self, completed, total, hits, elapsed):
+        self.completed = int(completed)
+        self.total = int(total)
+        self.hits = int(hits)
+        self.elapsed = float(elapsed)
+        pct = 100 if total == 0 else min(100, int(completed * 100 / total))
+
+        if self.app is not None:
+            try:
+                call_from_thread = getattr(self.app, "call_from_thread", None)
+                update_progress = getattr(self.app, "update_progress", None)
+                if callable(call_from_thread) and callable(update_progress):
+                    call_from_thread(update_progress,
+                                     self.completed, self.total, self.hits, self.elapsed)
+                elif callable(update_progress):
+                    update_progress(self.completed, self.total, self.hits, self.elapsed)
+            except (RuntimeError, AttributeError):
+                update_progress = getattr(self.app, "update_progress", None)
+                if callable(update_progress):
+                    update_progress(self.completed, self.total, self.hits, self.elapsed)
+        return format_progress(completed, total, hits, elapsed)
+
+
+if HAVE_TEXTUAL:
+    class GeneWeaverApp(App):
+        CSS = """
+        Screen { layout: vertical; }
+        #title { height: 3; content-align: center middle; text-style: bold; }
+        #status { height: 3; content-align: left middle; padding: 0 1; }
+        #progress { height: 3; margin: 1 1; }
+        #buttons { height: 5; align: center middle; }
+        """
+
+        BINDINGS = [
+            Binding("q", "quit", "Quit"),
+            Binding("r", "run_search", "Run search"),
+        ]
+
+        def __init__(self, genome=None, guides=None, config=None, backend="emulated",
+                     chunk_size=None, threads=128, scheme="matrix"):
+            super().__init__()
+            self.genome = genome
+            self.guides = guides
+            self.config = config or CONFIGS["C2"]
+            self.backend = backend
+            self.chunk_size = chunk_size
+            self.threads = threads
+            self.scheme = scheme
+            self.results = []
+            self.progress_view = TextualProgressView(self)
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static("GeneWeaver - Genome Off-Target Search", id="title")
+            yield ProgressBar(total=100, show_eta=True, id="progress")
+            yield Label("Ready", id="status")
+            yield Horizontal(
+                Button("Run search", id="run", variant="primary"),
+                Button("Quit", id="quit", variant="error"),
+                id="buttons",
+            )
+            yield Footer()
+
+        def on_mount(self):
+            self.query_one("#progress", ProgressBar).update(total=100, progress=0)
+
+        def on_button_pressed(self, event):
+            if event.button.id == "run":
+                self.action_run_search()
+            elif event.button.id == "quit":
+                self.action_quit()
+
+        def update_progress(self, completed, total, hits, elapsed):
+            pct = 100 if total == 0 else min(100, int(completed * 100 / total))
+            self.query_one("#progress", ProgressBar).update(total=100, progress=pct)
+            self.query_one("#status", Label).update(
+                format_progress(completed, total, hits, elapsed)
+            )
+
+        def action_run_search(self):
+            self.run_worker(self._run_search, exclusive=True)
+
+        def _run_search(self):
+            if not self.genome:
+                mock = generate_mock(scale=0.0001, chroms=["chr21", "chr22"], n_guides=3)
+                self.genome = {name: seq.decode() for name, seq in mock["genome"].items()}
+                self.guides = mock["guides"]
+            self.results = gpu_search(
+                self.genome, self.guides, self.config, self.chunk_size,
+                self.backend, self.threads, progress=self.progress_view,
+                scheme=self.scheme,
+            )
+            self.call_from_thread(
+                self.query_one("#status", Label).update,
+                f"Complete: {len(self.results)} hits",
+            )
+
+
+    # Descriptive aliases for callers and test discovery.
+    TextualApp = GeneWeaverApp
+    TuiApp = GeneWeaverApp
+    TextualInterface = GeneWeaverApp
+else:
+    class GeneWeaverApp:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("Textual is not installed; run: pip install textual")
+
+    TextualApp = GeneWeaverApp
+    TuiApp = GeneWeaverApp
+    TextualInterface = GeneWeaverApp
+
+
+def run_textual_app(genome=None, guides=None, config=None, backend="emulated",
+                    chunk_size=None, threads=128, scheme="matrix"):
+    """Launch the Day 9 Textual interface."""
+    if not HAVE_TEXTUAL:
+        raise RuntimeError("Textual is not installed; run: pip install textual")
+    app = GeneWeaverApp(genome, guides, config, backend, chunk_size, threads, scheme)
+    app.run()
+    return app
+
+
 def format_gpu(rec, saved=None):
     gpu = rec["gpu"]
     backend = rec.get("backend", gpu.get("backend"))
@@ -1577,7 +1969,9 @@ def format_gpu(rec, saved=None):
                 if chk.get("matches_baseline") else "DIFFERS from the Day 5 pure-Python baseline")
     lines = [
         f"backend     : {backend} ({device})",
-        f"kernel      : mismatch_kernel, {rec['threads_per_block']} threads/block",
+        f"kernel      : {'compact_kernel' if rec.get('scheme') == 'compact' else 'mismatch_kernel'}, "
+        f"{rec['threads_per_block']} threads/block",
+        f"transfers   : {rec.get('scheme', 'matrix')} scheme",
         f"genome      : {rec['genome']}  {rec['genome_bp']:,} bp   guides: {rec['n_guides']}   config {rec['config']}",
         f"runs (s)    : " + "  ".join(f"{seconds:.3f}" for seconds in rec["runs_s"]),
         f"median      : {rec['median_search_s']:.3f} s",
@@ -1589,6 +1983,48 @@ def format_gpu(rec, saved=None):
         lines.append(f"check       : planted sites found {chk['planted_found']}/{chk['planted_total']}")
     if saved:
         lines.append(f"saved       : {saved}")
+    return "\n".join(lines)
+
+
+def compare_schemes(genome, guides, cfg, backend="emulated"):
+    results = {}
+    for scheme in SCHEMES:
+        stats = TransferStats()
+        hits = gpu_search(genome, guides, cfg, 1_000_000, backend, scheme=scheme, stats=stats)
+        results[scheme] = {"hits": len(hits), "stats": stats.as_dict(), "_hits": hits}
+    hit_sets = {tuple(hit.key() for hit in row["_hits"]) for row in results.values()}
+    identical = len(hit_sets) == 1
+    clean = {name: {"hits": row["hits"], "stats": row["stats"]} for name, row in results.items()}
+    return {"identical": identical, "schemes": clean, "backend": gpu_backend(backend)}
+
+
+def format_comparison(cmp):
+    schemes = cmp["schemes"]
+    backend = cmp.get("backend", "emulated")
+    matrix = schemes["matrix"]["stats"]
+    compact = schemes["compact"]["stats"]
+    multi = schemes["multi"]["stats"]
+    matrix_dl = matrix["d2h_bytes"]
+    compact_dl = compact["d2h_bytes"]
+    lines = [
+        "Day 6 matrix",
+        f"  host -> device: {matrix['h2d_bytes']} bytes",
+        f"  device -> host: {matrix_dl} bytes",
+        f"  kernel launches: {matrix['launches']}",
+        "Day 7 compact",
+        f"  host -> device: {compact['h2d_bytes']} bytes",
+        f"  device -> host: {compact_dl} bytes",
+        f"  kernel launches: {compact['launches']}",
+        "Day 8 multi",
+        f"  host -> device: {multi['h2d_bytes']} bytes",
+        f"  device -> host: {multi['d2h_bytes']} bytes",
+        f"  kernel launches: {multi['launches']}",
+        f"download vs Day 6: compact is {max(matrix_dl, 1) // max(compact_dl, 1)}x smaller",
+        "all three schemes return identical hits" if cmp["identical"] else "DIFFERENT hit sets",
+        f"backend: {backend}",
+    ]
+    if backend == "gpu":
+        lines.append("transfer time: recorded per transfer")
     return "\n".join(lines)
 
 
@@ -1617,7 +2053,7 @@ def cmd_gpu(a):
         view = ProgressView()
         print("Day 6 - first CUDA kernel")
         rec, _ = run_gpu(genome, guides, a.config, selected, a.runs, a.warmup, truth,
-                         a.chunk_size, a.threads, genome_id, guide_set, genome_sha, view)
+                         a.chunk_size, a.threads, genome_id, guide_set, genome_sha, view, a.scheme)
         saved = save_gpu(rec, a.out_dir)
         print(format_gpu(rec, saved))
         if a.verify and (not rec["correctness"]["matches_baseline"]
@@ -1627,6 +2063,30 @@ def cmd_gpu(a):
     except (ValueError, RuntimeError, OSError) as e:
         print("ERROR:", e)
         return 2
+
+
+def cmd_transfers(a):
+    try:
+        selected = gpu_backend(a.backend)
+    except (ValueError, RuntimeError) as e:
+        print("ERROR:", e)
+        return 2
+    cfg = CONFIGS[a.config]
+    if cfg["db"] or cfg["rb"]:
+        print(f"ERROR: {a.config} has bulges; transfer schemes are mismatch-only.")
+        return 2
+    mock = generate_mock(scale=a.scale, chroms=["chr21", "chr22"], seed=a.seed,
+                         n_guides=a.n_guides)
+    genome = {name: seq.decode() for name, seq in mock["genome"].items()}
+    cmp = compare_schemes(genome, mock["guides"], cfg, selected)
+    print("Day 7 - host/device memory transfers")
+    print(format_comparison(cmp))
+    os.makedirs(a.out_dir, exist_ok=True)
+    path = os.path.join(a.out_dir, "transfer_comparison.json")
+    with open(path, "w") as fh:
+        json.dump(cmp, fh, indent=2)
+    print(f"saved       : {path}")
+    return 0
 
 
 # ======================================================================
@@ -1915,6 +2375,27 @@ def main(argv=None):
     g.add_argument("--out-dir", default="results")
     g.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     g.add_argument("--verify", action="store_true", help="check results against the Day 5 baseline and planted sites")
+    g.add_argument("--scheme", default="matrix", choices=list(SCHEMES), help="transfer scheme")
+    tr = sub.add_parser("transfers", help="Day 7/8: compare matrix, compact and multi transfer schemes")
+    tr.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+    tr.add_argument("--backend", default="auto", choices=["auto", "gpu", "emulated"])
+    tr.add_argument("--scale", type=float, default=0.0001)
+    tr.add_argument("--n-guides", type=int, default=12)
+    tr.add_argument("--seed", type=int, default=SEED)
+    tr.add_argument("--out-dir", default="results")
+    tui = sub.add_parser("tui", help="Day 9: launch the Textual terminal interface")
+    tui.add_argument("--genome", help="genome FASTA")
+    tui.add_argument("--guides", help="guide FASTA/TSV")
+    tui.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+    tui.add_argument("--backend", default="emulated", choices=["auto", "gpu", "emulated"])
+    tui.add_argument("--scheme", default="matrix", choices=list(SCHEMES))
+    tui.add_argument("--chunk-size", type=int)
+    tui.add_argument("--threads", type=int, default=128)
+    tui.add_argument("--scale", type=float, default=0.0001)
+    tui.add_argument("--n-guides", type=int, default=10)
+    tui.add_argument("--seed", type=int, default=SEED)
+    tui.add_argument("--chroms", default="chr21,chr22")
+    tui.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -2027,6 +2508,24 @@ def main(argv=None):
     if a.command == "gpu":
         debug_log(f"GPU config={a.config} backend={a.backend} runs={a.runs} warmup={a.warmup}")
         return cmd_gpu(a)
+    if a.command == "transfers":
+        return cmd_transfers(a)
+    if a.command == "tui":
+        try:
+            if a.genome:
+                genome = read_genome(a.genome, a.parser)
+                guides = read_guides_any(a.guides, a.parser) if a.guides else make_guides(genome, a.n_guides, a.seed)
+            else:
+                chroms = [name.strip() for name in a.chroms.split(",") if name.strip()] or None
+                mock = generate_mock(scale=a.scale, chroms=chroms, seed=a.seed, n_guides=a.n_guides)
+                genome = {name: seq.decode() for name, seq in mock["genome"].items()}
+                guides = mock["guides"]
+            run_textual_app(genome, guides, CONFIGS[a.config], a.backend,
+                            a.chunk_size, a.threads, a.scheme)
+            return 0
+        except (ValueError, RuntimeError, OSError) as e:
+            print("ERROR:", e)
+            return 2
     if a.command == "rules":
         if a.out:
             _write(a.out, rules_markdown())
@@ -2052,6 +2551,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    print("Loading configuration....")
-    print("Done loading configuration")
     sys.exit(main())
