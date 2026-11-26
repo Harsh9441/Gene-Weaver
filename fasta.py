@@ -9,7 +9,7 @@
   python fasta.py animate [--delay 0.45] [--plain]                                           # Day 4 animation
   python fasta.py baseline [--config C2] [--runs 5]                                          # Day 5: timed pure-Python baseline
   python fasta.py gpu [--backend auto|gpu|emulated] [--config C2] [--verify]                # Day 6: CUDA kernel
-  python fasta.py tui [--backend auto|gpu|emulated] [--config C2] [--scheme matrix]         # Day 9: Textual interface
+  python fasta.py tui [--backend auto|gpu|emulated] [--config C2] [--scheme matrix]         # Day 9/10: Textual search pipeline
   python fasta.py --debug baseline [--runs 5]                                                # verbose diagnostics
   python fasta.py baseline --debug [--runs 5]                                                # same, flag after command
   GENEWEAVER_DEBUG=1 python fasta.py selftest                                                # enable diagnostics via environment
@@ -1767,6 +1767,22 @@ def save_gpu(rec, out_dir):
     return path
 
 
+def run_search_pipeline(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None,
+                        chunk_size=None, threads=128, genome_id="G-mock", guide_set="S-mock",
+                        genome_sha=None, load_s=None, progress=None, scheme="matrix",
+                        out_dir="results"):
+    """Run, verify and persist one GPU search."""
+    rec, hits = run_gpu(
+        genome, guides, config, backend=backend, runs=runs, warmup=warmup,
+        truth=truth, chunk_size=chunk_size, threads=threads, genome_id=genome_id,
+        guide_set=guide_set, genome_sha=genome_sha, progress=progress, scheme=scheme,
+    )
+    if load_s is not None:
+        rec["load_s"] = load_s
+    saved = save_gpu(rec, out_dir)
+    return rec, hits, saved
+
+
 def format_progress(completed, total, hits, elapsed):
     pct = 100 if total == 0 else min(100, int(completed * 100 / total))
     filled = 30 if total == 0 else min(30, int(completed * 30 / total))
@@ -1872,7 +1888,9 @@ if HAVE_TEXTUAL:
         ]
 
         def __init__(self, genome=None, guides=None, config=None, backend="emulated",
-                     chunk_size=None, threads=128, scheme="matrix"):
+                     chunk_size=None, threads=128, scheme="matrix", truth=None,
+                     genome_id="G-mock", guide_set="S-mock", genome_sha=None,
+                     load_s=None, runs=1, warmup=0, out_dir="results"):
             super().__init__()
             self.genome = genome
             self.guides = guides
@@ -1881,7 +1899,17 @@ if HAVE_TEXTUAL:
             self.chunk_size = chunk_size
             self.threads = threads
             self.scheme = scheme
+            self.truth = truth
+            self.genome_id = genome_id
+            self.guide_set = guide_set
+            self.genome_sha = genome_sha
+            self.load_s = load_s
+            self.runs = runs
+            self.warmup = warmup
+            self.out_dir = out_dir
             self.results = []
+            self.record = None
+            self.saved_path = None
             self.progress_view = TextualProgressView(self)
 
         def compose(self) -> ComposeResult:
@@ -1913,21 +1941,25 @@ if HAVE_TEXTUAL:
             )
 
         def action_run_search(self):
-            self.run_worker(self._run_search, exclusive=True)
+            self.run_worker(self._run_search, exclusive=True, thread=True)
 
         def _run_search(self):
             if not self.genome:
                 mock = generate_mock(scale=0.0001, chroms=["chr21", "chr22"], n_guides=3)
                 self.genome = {name: seq.decode() for name, seq in mock["genome"].items()}
                 self.guides = mock["guides"]
-            self.results = gpu_search(
-                self.genome, self.guides, self.config, self.chunk_size,
-                self.backend, self.threads, progress=self.progress_view,
-                scheme=self.scheme,
+                self.truth = mock["truth"]
+                self.genome_id, self.guide_set = "G-mock", "S-mock"
+            self.record, self.results, self.saved_path = run_search_pipeline(
+                self.genome, self.guides, self.config, self.backend,
+                self.runs, self.warmup, self.truth, self.chunk_size, self.threads,
+                self.genome_id, self.guide_set, self.genome_sha, self.load_s,
+                self.progress_view, self.scheme, self.out_dir,
             )
             self.call_from_thread(
                 self.query_one("#status", Label).update,
-                f"Complete: {len(self.results)} hits",
+                f"Complete: {len(self.results)} hits; "
+                f"{self.record['correctness']['note']}; saved {self.saved_path}",
             )
 
 
@@ -1946,11 +1978,15 @@ else:
 
 
 def run_textual_app(genome=None, guides=None, config=None, backend="emulated",
-                    chunk_size=None, threads=128, scheme="matrix"):
-    """Launch the Day 9 Textual interface."""
+                    chunk_size=None, threads=128, scheme="matrix", truth=None,
+                    genome_id="G-mock", guide_set="S-mock", genome_sha=None,
+                    load_s=None, runs=1, warmup=0, out_dir="results"):
+    """Launch the Textual interface for the shared search pipeline."""
     if not HAVE_TEXTUAL:
         raise RuntimeError("Textual is not installed; run: pip install textual")
-    app = GeneWeaverApp(genome, guides, config, backend, chunk_size, threads, scheme)
+    app = GeneWeaverApp(genome, guides, config, backend, chunk_size, threads, scheme,
+                        truth, genome_id, guide_set, genome_sha, load_s, runs, warmup,
+                        out_dir)
     app.run()
     return app
 
@@ -1979,6 +2015,8 @@ def format_gpu(rec, saved=None):
         f"hits        : {rec['total_hits']}",
         f"baseline    : {baseline}",
     ]
+    if rec.get("load_s") is not None:
+        lines.insert(4, f"load time   : {rec['load_s']:.4f} s")
     if chk.get("planted_total") is not None:
         lines.append(f"check       : planted sites found {chk['planted_found']}/{chk['planted_total']}")
     if saved:
@@ -2052,9 +2090,11 @@ def cmd_gpu(a):
             genome_id, guide_set = "G-mock", "S-mock"
         view = ProgressView()
         print("Day 6 - first CUDA kernel")
-        rec, _ = run_gpu(genome, guides, a.config, selected, a.runs, a.warmup, truth,
-                         a.chunk_size, a.threads, genome_id, guide_set, genome_sha, view, a.scheme)
-        saved = save_gpu(rec, a.out_dir)
+        rec, _, saved = run_search_pipeline(
+            genome, guides, a.config, selected, a.runs, a.warmup, truth,
+            a.chunk_size, a.threads, genome_id, guide_set, genome_sha, load_s,
+            view, a.scheme, a.out_dir,
+        )
         print(format_gpu(rec, saved))
         if a.verify and (not rec["correctness"]["matches_baseline"]
                          or (truth is not None and rec["correctness"]["planted_found"] != rec["correctness"]["planted_total"])):
@@ -2383,7 +2423,7 @@ def main(argv=None):
     tr.add_argument("--n-guides", type=int, default=12)
     tr.add_argument("--seed", type=int, default=SEED)
     tr.add_argument("--out-dir", default="results")
-    tui = sub.add_parser("tui", help="Day 9: launch the Textual terminal interface")
+    tui = sub.add_parser("tui", help="Day 9/10: run a verified, saved search from the Textual interface")
     tui.add_argument("--genome", help="genome FASTA")
     tui.add_argument("--guides", help="guide FASTA/TSV")
     tui.add_argument("--config", default="C2", choices=sorted(CONFIGS))
@@ -2391,6 +2431,9 @@ def main(argv=None):
     tui.add_argument("--scheme", default="matrix", choices=list(SCHEMES))
     tui.add_argument("--chunk-size", type=int)
     tui.add_argument("--threads", type=int, default=128)
+    tui.add_argument("--runs", type=int, default=1)
+    tui.add_argument("--warmup", type=int, default=0)
+    tui.add_argument("--out-dir", default="results")
     tui.add_argument("--scale", type=float, default=0.0001)
     tui.add_argument("--n-guides", type=int, default=10)
     tui.add_argument("--seed", type=int, default=SEED)
@@ -2513,15 +2556,26 @@ def main(argv=None):
     if a.command == "tui":
         try:
             if a.genome:
+                t0 = time.perf_counter()
                 genome = read_genome(a.genome, a.parser)
+                load_s = round(time.perf_counter() - t0, 4)
+                genome_sha = sha256(a.genome)
+                genome_id = os.path.basename(a.genome)
                 guides = read_guides_any(a.guides, a.parser) if a.guides else make_guides(genome, a.n_guides, a.seed)
+                guide_set = os.path.basename(a.guides) if a.guides else f"random-{len(guides)}"
+                truth = None
             else:
                 chroms = [name.strip() for name in a.chroms.split(",") if name.strip()] or None
                 mock = generate_mock(scale=a.scale, chroms=chroms, seed=a.seed, n_guides=a.n_guides)
                 genome = {name: seq.decode() for name, seq in mock["genome"].items()}
                 guides = mock["guides"]
-            run_textual_app(genome, guides, CONFIGS[a.config], a.backend,
-                            a.chunk_size, a.threads, a.scheme)
+                truth = mock["truth"]
+                genome_id, guide_set, genome_sha, load_s = "G-mock", "S-mock", None, None
+            run_textual_app(
+                genome, guides, CONFIGS[a.config], a.backend,
+                a.chunk_size, a.threads, a.scheme, truth, genome_id, guide_set,
+                genome_sha, load_s, a.runs, a.warmup, a.out_dir,
+            )
             return 0
         except (ValueError, RuntimeError, OSError) as e:
             print("ERROR:", e)
