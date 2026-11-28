@@ -9,6 +9,7 @@
   python fasta.py animate [--delay 0.45] [--plain]                                           # Day 4 animation
   python fasta.py baseline [--config C2] [--runs 5]                                          # Day 5: timed pure-Python baseline
   python fasta.py gpu [--backend auto|gpu|emulated] [--config C2] [--verify]                # Day 6: CUDA kernel
+  python fasta.py pipeline [--genome genome.fa] [--guides guides.tsv] [--backend emulated]  # Day 10: QC -> chunks -> verified search
   python fasta.py tui [--backend auto|gpu|emulated] [--config C2] [--scheme matrix]         # Day 9/10: Textual search pipeline
   python fasta.py --debug baseline [--runs 5]                                                # verbose diagnostics
   python fasta.py baseline --debug [--runs 5]                                                # same, flag after command
@@ -268,6 +269,42 @@ def normalize(hits) -> list[Hit]:
     """Rules s6.1: dedupe + stable order."""
     # full tie-breaker: several hits can share (guide, chrom, start, strand) with different edits/lengths
     return sorted(set(hits), key=lambda h: (h.guide_id, h.chrom, h.start, h.strand, h.mm, h.db, h.rb, h.target))
+
+
+def guide_summary(hits, guides):
+    rows = []
+    for guide_id, _sequence in guides:
+        guide_hits = [hit for hit in hits if hit.guide_id == guide_id]
+        mismatches = [hit.mm for hit in guide_hits]
+        rows.append({
+            "guide": guide_id,
+            "forward": sum(hit.strand == "+" for hit in guide_hits),
+            "reverse": sum(hit.strand == "-" for hit in guide_hits),
+            "exact": sum(hit.mm == 0 for hit in guide_hits),
+            "best": min(mismatches) if mismatches else None,
+            "total": len(guide_hits),
+        })
+    return rows
+
+
+def format_guide_summary(rows, top=10):
+    lines = [
+        "guide forward reverse exact best total",
+        "----- ------- ------- ----- ---- -----",
+    ]
+    for row in rows[:top]:
+        best = "-" if row["best"] is None else str(row["best"])
+        lines.append(f"{row['guide']} {row['forward']} {row['reverse']} {row['exact']} {best} {row['total']}")
+    if len(rows) > top:
+        lines.append(f"... and {len(rows) - top} more guides")
+    forward = sum(row["forward"] for row in rows)
+    reverse = sum(row["reverse"] for row in rows)
+    exact = sum(row["exact"] for row in rows)
+    best_values = [row["best"] for row in rows if row["best"] is not None]
+    all_best = "-" if not best_values else str(min(best_values))
+    total = sum(row["total"] for row in rows)
+    lines.append(f"all {forward} {reverse} {exact} {all_best} {total}")
+    return "\n".join(lines)
 
 
 def write_hits(hits, path: str) -> None:
@@ -1295,6 +1332,33 @@ def revcomp_codes(codes):
     return table[np.asarray(codes, dtype=np.uint8)[::-1]]
 
 
+MAX_PACKED_GUIDE = 31
+
+
+def low_bits(length):
+    if not isinstance(length, int) or length < 1:
+        raise ValueError("length must be a positive integer")
+    if length > MAX_PACKED_GUIDE:
+        raise ValueError("at most 31 guide bases can be packed")
+    return sum(1 << (2 * k) for k in range(length))
+
+
+def pack_guides(codes):
+    _require_numpy()
+    codes = np.asarray(codes, dtype=np.uint8)
+    if codes.ndim != 2:
+        raise ValueError("guide codes must be a 2-D array")
+    if codes.shape[1] > MAX_PACKED_GUIDE:
+        raise ValueError("at most 31 guide bases can be packed")
+    words = np.zeros(codes.shape[0], dtype=np.int64)
+    for g in range(codes.shape[0]):
+        word = 0
+        for k in range(codes.shape[1]):
+            word |= int(codes[g, k]) << (2 * k)
+        words[g] = word
+    return words
+
+
 def emulate_launch(kernel, blocks, threads, args):
     if blocks < 0 or threads < 1:
         raise ValueError("blocks must be non-negative and threads must be positive")
@@ -1358,7 +1422,7 @@ def scan_codes(codes, guides, glen, masks, mm, backend="auto", threads=128):
     if not isinstance(mm, int) or not 0 <= mm <= 254:
         raise ValueError("mismatch budget must be between 0 and 254")
     if threads < 1:
-        raise ValueError("threads must be positive")
+        raise ValueError("threads per block must be positive")
     codes = np.asarray(codes, dtype=np.uint8)
     guides = np.asarray(guides, dtype=np.uint8)
     masks = np.asarray(masks, dtype=np.uint8)
@@ -1537,6 +1601,52 @@ def compact_kernel(codes, codes_len, strand, n_pos, guides, glen, masks, masks_l
                         hits[slot, 2] = distance
 
 
+@cuda.jit
+def multi_kernel(codes, codes_len, n_pos, guide_words, glen, low_mask, masks, masks_len,
+                 mm, guide_offset, hits, counter, capacity):
+    t = cuda.grid(1)
+    if t >= 2 * n_pos:
+        return
+    strand = 0 if t < n_pos else 1
+    i = t if strand == 0 else t - n_pos
+
+    valid = True
+    for k in range(masks_len):
+        pam_index = i + glen + k
+        if strand == 0:
+            raw_base = int(codes[pam_index])
+            base = raw_base if raw_base <= 3 else 4
+        else:
+            raw_base = int(codes[codes_len - 1 - pam_index])
+            base = (3 - raw_base) if raw_base <= 3 else 4
+        if base > 3 or (int(masks[k]) & (1 << base)) == 0:
+            valid = False
+            break
+    if not valid:
+        return
+
+    for g in range(len(guide_words)):
+        distance = 0
+        for j in range(glen):
+            spacer_index = i + j
+            if strand == 0:
+                raw_base = int(codes[spacer_index])
+                base = raw_base if raw_base <= 3 else 4
+            else:
+                raw_base = int(codes[codes_len - 1 - spacer_index])
+                base = (3 - raw_base) if raw_base <= 3 else 4
+            guide_base = (int(guide_words[g]) >> (2 * j)) & 3
+            if base != guide_base:
+                distance += 1
+        if distance <= mm:
+            slot = cuda.atomic.add(counter, 0, 1)
+            if slot < capacity:
+                hits[slot, 0] = i
+                hits[slot, 1] = strand
+                hits[slot, 2] = g + guide_offset
+                hits[slot, 3] = distance
+
+
 def host_to_device(host_array, stream=0):
     """Copy a contiguous NumPy array from host memory to a CUDA device."""
     _require_numpy()
@@ -1559,7 +1669,7 @@ def device_to_host(device_array, stream=0):
 
 
 def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128, progress=None,
-               scheme="matrix", stats=None, hit_capacity=64):
+               scheme="matrix", stats=None, hit_capacity=64, guide_batch=0):
     """Search all guides on both strands, batching guides with the same length."""
     _require_numpy()
     if scheme not in SCHEMES:
@@ -1576,9 +1686,11 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
     if chunk_size < 1:
         raise ValueError("chunk size must be positive")
     if threads < 1:
-        raise ValueError("threads must be positive")
+        raise ValueError("threads per block must be positive")
     if not isinstance(hit_capacity, int) or hit_capacity < 1:
         raise ValueError("hit capacity must be positive")
+    if not isinstance(guide_batch, int) or guide_batch < 0:
+        raise ValueError("guide batch size must be non-negative")
 
     guides_by_len = {}
     for guide_id, sequence in guides:
@@ -1623,19 +1735,72 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
         if scheme == "compact":
             tracked.up(len(seq))
             tracked.up(2 * 4)
-            tracked.launches += 2
             if hit_capacity == 1:
                 tracked.alloc(np.dtype(np.int32).itemsize * 3)
-                tracked.launches += 2
-        elif scheme == "multi":
-            tracked.up(len(seq))
-            tracked.up(4)
-            tracked.launches += 1
-            if hit_capacity == 1:
-                tracked.alloc(np.dtype(np.int32).itemsize * 3)
-                tracked.launches += 1
         for own_start, own_end, read_start, read_end in plan:
             forward = codes[read_start:read_end]
+            if scheme == "multi":
+                sess = DeviceSession(selected)
+                d_codes = sess.put(forward)
+                d_masks = sess.put(masks)
+                for glen, entries in guides_by_len.items():
+                    batch_entries = list(entries)
+                    if guide_batch == 0:
+                        batches = [batch_entries]
+                    else:
+                        batches = [batch_entries[i:i + guide_batch]
+                                   for i in range(0, len(batch_entries), guide_batch)]
+                    n_pos = max(0, len(forward) - glen - len(masks) + 1)
+                    for batch_start, batch in enumerate(batches):
+                        if guide_batch == 0:
+                            guide_offset = 0
+                        else:
+                            guide_offset = batch_start * guide_batch
+                        guide_array = np.stack([entry[1] for entry in batch]).astype(np.uint8, copy=False)
+                        d_words = sess.put(pack_guides(guide_array))
+                        d_hits = sess.alloc((hit_capacity, 4), np.int32)
+                        d_count = sess.alloc((1,), np.int32)
+                        blocks = (2 * n_pos + threads - 1) // threads
+                        sess.launch(multi_kernel, blocks, threads,
+                                    d_codes, len(forward), n_pos, d_words, glen,
+                                    low_bits(glen), d_masks, len(masks), cfg["mm"],
+                                    guide_offset, d_hits, d_count, hit_capacity)
+                        tracked.launches += 1
+                        count = int(sess.get(d_count, 1)[0])
+                        if count > hit_capacity:
+                            tracked.alloc(np.dtype(np.int32).itemsize * count * 4)
+                            d_hits = sess.alloc((count, 4), np.int32)
+                            d_count = sess.alloc((1,), np.int32)
+                            sess.launch(multi_kernel, blocks, threads,
+                                        d_codes, len(forward), n_pos, d_words, glen,
+                                        low_bits(glen), d_masks, len(masks), cfg["mm"],
+                                        guide_offset, d_hits, d_count, count)
+                            tracked.launches += 1
+                            count = int(sess.get(d_count, 1)[0])
+                        rows = sess.get(d_hits, count)
+                        for row in rows:
+                            pos, strand_code, guide_index, distance = (int(x) for x in row)
+                            if strand_code == 0:
+                                forward_start = read_start + pos
+                                target_codes = forward[pos:pos + glen + len(masks)]
+                                strand = "+"
+                            else:
+                                forward_start = read_end - (pos + glen + len(masks))
+                                target_codes = revcomp_codes(forward)[pos:pos + glen + len(masks)]
+                                strand = "-"
+                            if not own_start <= forward_start < own_end:
+                                continue
+                            local_guide_index = guide_index - guide_offset
+                            if local_guide_index < 0 or local_guide_index >= len(batch):
+                                continue
+                            guide_id = batch[local_guide_index][0]
+                            hits.append(Hit(guide_id, chrom, forward_start, strand, distance, 0, 0,
+                                            _decode_codes(target_codes)))
+                completed += 1
+                if progress is not None:
+                    progress(completed, total_chunks, len(hits), time.perf_counter() - started)
+                continue
+
             for strand, oriented in (("+", forward), ("-", revcomp_codes(forward))):
                 if scheme == "matrix":
                     for glen, entries in guides_by_len.items():
@@ -1663,6 +1828,10 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
                 for glen, entries in guides_by_len.items():
                     result = scan_codes(oriented, encoded_guides[glen], glen, masks, cfg["mm"],
                                         "emulated", threads)
+                    if scheme == "compact":
+                        tracked.launches += 1
+                        if hit_capacity == 1:
+                            tracked.launches += 1
                     for pos in range(result.shape[0]):
                         forward_start = (read_start + pos if strand == "+"
                                          else read_end - (pos + glen + len(masks)))
@@ -1688,7 +1857,7 @@ def gpu_search(genome, guides, cfg, chunk_size=None, backend="auto", threads=128
 
 def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None,
             chunk_size=None, threads=128, genome_id="G-mock", guide_set="S-mock",
-            genome_sha=None, progress=None, scheme="matrix"):
+            genome_sha=None, progress=None, scheme="matrix", guide_batch=0):
     if runs < 1 or warmup < 0:
         raise ValueError("need runs >= 1 and warmup >= 0")
     cfg = CONFIGS[config] if isinstance(config, str) else config
@@ -1698,7 +1867,8 @@ def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None
         chunk_size = auto_chunk_size(n_bp)
     transfer_stats = TransferStats()
     search = lambda: gpu_search(genome, guides, cfg, chunk_size, selected, threads,
-                                scheme=scheme, stats=transfer_stats if scheme != "matrix" else None)
+                                scheme=scheme, stats=transfer_stats if scheme != "matrix" else None,
+                                guide_batch=guide_batch)
     for _ in range(warmup):
         search()
     times, hits = [], None
@@ -1706,7 +1876,8 @@ def run_gpu(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None
         t0 = time.perf_counter()
         hits = gpu_search(genome, guides, cfg, chunk_size, selected, threads,
                           progress if index == runs - 1 else None, scheme=scheme,
-                          stats=transfer_stats if scheme != "matrix" else None)
+                          stats=transfer_stats if scheme != "matrix" else None,
+                          guide_batch=guide_batch)
         times.append(time.perf_counter() - t0)
 
     baseline_hits = packed_search(genome, guides, cfg)
@@ -1770,12 +1941,13 @@ def save_gpu(rec, out_dir):
 def run_search_pipeline(genome, guides, config, backend="auto", runs=5, warmup=1, truth=None,
                         chunk_size=None, threads=128, genome_id="G-mock", guide_set="S-mock",
                         genome_sha=None, load_s=None, progress=None, scheme="matrix",
-                        out_dir="results"):
+                        out_dir="results", guide_batch=0):
     """Run, verify and persist one GPU search."""
     rec, hits = run_gpu(
         genome, guides, config, backend=backend, runs=runs, warmup=warmup,
         truth=truth, chunk_size=chunk_size, threads=threads, genome_id=genome_id,
         guide_set=guide_set, genome_sha=genome_sha, progress=progress, scheme=scheme,
+        guide_batch=guide_batch,
     )
     if load_s is not None:
         rec["load_s"] = load_s
@@ -1783,10 +1955,45 @@ def run_search_pipeline(genome, guides, config, backend="auto", runs=5, warmup=1
     return rec, hits, saved
 
 
+def replay(text):
+    screen, row, i = [""], 0, 0
+    while i < len(text):
+        m = re.match(r"\x1b\[(\d*)([AK])", text[i:])
+        if m:
+            if m.group(2) == "A":
+                row = max(0, row - int(m.group(1) or 1))
+            else:
+                screen[row] = ""
+            i += m.end()
+            continue
+        if text[i] == "\n":
+            row += 1
+            while len(screen) <= row:
+                screen.append("")
+        else:
+            screen[row] += text[i]
+        i += 1
+    return screen
+
+
+def make_bar(frac, width):
+    frac = max(0.0, min(1.0, float(frac)))
+    width = int(width)
+    if frac <= 0:
+        return " " * width
+    if frac >= 1:
+        return "=" * width
+    cells = int(frac * width)
+    if cells == 0:
+        return ">" + " " * (width - 1)
+    if cells >= width:
+        return "=" * (width - 1) + "> "
+    return "=" * (cells - 1) + "> " + " " * (width - cells - 1)
+
+
 def format_progress(completed, total, hits, elapsed):
     pct = 100 if total == 0 else min(100, int(completed * 100 / total))
-    filled = 30 if total == 0 else min(30, int(completed * 30 / total))
-    bar = "=" * filled + " " * (30 - filled)
+    bar = make_bar(0 if total == 0 else completed / total, 30)
     return (f"[{bar}] {pct:3d}%  chunk {completed}/{total}  hits {hits}  "
             f"{elapsed:.1f}s")
 
@@ -1810,6 +2017,453 @@ class ProgressView:
             self.out.write(line + "\n")
             self.out.flush()
             self._last_step = completed // step
+
+
+PIPELINE_STAGES = ("setup", "inputs", "inspect", "plan", "baseline", "search", "verify", "report")
+ORACLE_LIMIT_BP = 100_000_000
+
+
+@dataclass(frozen=True)
+class PipelineOptions:
+    out_dir: str = "pipeline_run"
+    runs: int = 5
+    warmup: int = 1
+    n_guides: int = 10
+    seed: int = SEED
+    scale: float = 0.0001
+    chroms: str = "chr21,chr22"
+    config: str = "C2"
+    scheme: str = "multi"
+    backend: str = "auto"
+    threads: int = 128
+    chunk_size: int | None = None
+    genome: str | None = None
+    guides: str | None = None
+    parser: str = "auto"
+    verify: bool = True
+    no_oracle: bool = False
+
+
+def pipeline_options(**kw):
+    allowed = {field.name for field in PipelineOptions.__dataclass_fields__.values()}
+    unknown = set(kw) - allowed
+    if unknown:
+        name = sorted(unknown)[0]
+        raise ValueError(f"unknown pipeline option: {name}")
+    return PipelineOptions(**kw)
+
+
+class Dashboard:
+    def __init__(self, title, stages, out=None, ansi=None, width=None, clock=None, refresh_seconds=0.05):
+        import shutil
+        self.title = str(title)
+        self.stage_names = list(stages)
+        self.out = out if out is not None else sys.stdout
+        self.ansi = (self.out.isatty() if ansi is None else ansi)
+        self.width = width if width is not None else min(120, max(40, shutil.get_terminal_size((80, 24)).columns - 1))
+        self.width = max(40, int(self.width))
+        self.clock = clock or time.perf_counter
+        self.refresh_seconds = float(refresh_seconds)
+        self.started = self.clock()
+        self.last_draw = -float("inf")
+        self.closed = False
+        self.rows = [{"name": name, "status": "waiting", "frac": 0.0, "detail": "",
+                      "started": None, "elapsed": 0.0} for name in self.stage_names]
+        self.metrics = {}
+        self._row_by_name = {row["name"]: row for row in self.rows}
+        self._height = len(self.rows) + 4
+        if self.ansi and os.name == "nt":
+            os.system("")
+        self.refresh(True)
+
+    def elapsed(self):
+        return max(0.0, self.clock() - self.started)
+
+    def _stage(self, name):
+        try:
+            return self._row_by_name[name]
+        except KeyError:
+            raise KeyError(name)
+
+    def start(self, name):
+        row = self._stage(name)
+        row["status"] = "running"
+        row["frac"] = 0.0
+        row["detail"] = ""
+        row["started"] = self.clock()
+        row["elapsed"] = 0.0
+        self.refresh(False)
+
+    def progress(self, name, frac, detail=None):
+        row = self._stage(name)
+        row["frac"] = max(0.0, min(1.0, float(frac)))
+        if detail is not None:
+            row["detail"] = str(detail)
+        self.refresh(False)
+
+    def finish(self, name, ok=True, detail=None):
+        row = self._stage(name)
+        if row["started"] is not None:
+            row["elapsed"] = max(0.0, self.clock() - row["started"])
+        row["status"] = "done" if ok else "FAILED"
+        row["frac"] = 1.0 if ok else row["frac"]
+        if detail is not None:
+            row["detail"] = str(detail)
+        self.refresh(True)
+
+    def skip(self, name, detail="an earlier stage failed"):
+        row = self._stage(name)
+        row["status"] = "skipped"
+        row["frac"] = 0.0
+        row["detail"] = str(detail)
+        row["elapsed"] = 0.0
+        self.refresh(True)
+
+    def metric(self, key, value):
+        self.metrics[str(key)] = str(value)
+        self.refresh(False)
+
+    def chunk_progress(self, name):
+        def callback(completed, total, hits, elapsed):
+            frac = 1.0 if total == 0 or completed >= total else completed / total
+            detail = "complete" if total == 0 else f"chunk {completed}/{total}  hits {hits}"
+            self.progress(name, frac, detail)
+            self.metric("hits", hits)
+        return callback
+
+    def render(self):
+        lines = [self.title[:self.width].ljust(self.width), "-" * self.width]
+        for index, row in enumerate(self.rows, 1):
+            status = "done" if row["status"] == "ok" else row["status"]
+            elapsed = row["elapsed"] if status in ("done", "FAILED", "skipped") else (
+                max(0.0, self.clock() - row["started"]) if row["started"] is not None else 0.0
+            )
+            pct = int(round(row["frac"] * 100))
+            bar = make_bar(row["frac"], 15)
+            left = f"{index:2d} {row['name']:<8} [{bar}] {pct:3d}%  {status:<7} {elapsed:.2f}s"
+            detail = row["detail"]
+            if detail:
+                left += "  " + detail
+            lines.append(left[:self.width].ljust(self.width))
+        lines.append("-" * self.width)
+        parts = []
+        for key, value in self.metrics.items():
+            parts.append(f"{key} {value}")
+        parts.append(f"elapsed {self.elapsed():.1f}s")
+        lines.append("  ".join(parts)[:self.width].ljust(self.width))
+        return lines
+
+    def refresh(self, force=False):
+        now = self.clock()
+        if not force and now - self.last_draw < self.refresh_seconds:
+            return
+        if not self.ansi:
+            if force:
+                for row_index, row in enumerate(self.rows, 1):
+                    if row["status"] in ("done", "FAILED", "skipped") and not row.get("_printed"):
+                        elapsed = row["elapsed"]
+                        status = "done" if row["status"] == "done" else row["status"]
+                        line = f"[{row_index}/{len(self.rows)}] {row['name']}  {status}"
+                        if row["detail"]:
+                            line += f"  {row['detail']}"
+                        line += f"  {elapsed:.2f}s"
+                        self.out.write(line + "\n")
+                        row["_printed"] = True
+                        self.out.flush()
+            self.last_draw = now
+            return
+        lines = self.render()
+        if self.ansi:
+            if getattr(self, "_drawn", False):
+                self.out.write(f"\033[{self._height}A")
+            for line in lines:
+                self.out.write("\033[K" + line + "\n")
+        else:
+            for line in lines:
+                self.out.write(line + "\n")
+        self.out.flush()
+        self._drawn = True
+        self.last_draw = now
+        if not self.ansi:
+            self._plain_output = getattr(self, "_plain_output", "")
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.ansi:
+            self.refresh(True)
+        else:
+            return
+
+
+def _pipeline_stage(dash, name, detail):
+    if dash is not None:
+        dash.finish(name, True, detail)
+
+
+def format_pipeline(result):
+    if result["ok"]:
+        text = ["pipeline COMPLETE - every stage passed"]
+    else:
+        text = ["pipeline FAILED"]
+    text += [
+        f"backend     : {result['state'].get('backend', '')}",
+        f"speedup     : {result['state'].get('speedup_text', 'n/a')}",
+    ]
+    for stage in result["stages"]:
+        text.append(f"{stage['name']}: {stage['status']} - {stage['detail']}")
+    checks = result["state"].get("checks", [])
+    for name, ok in checks:
+        if ok:
+            text.append(f"[ok] {name}")
+    text.append("[ok] search hits equal baseline")
+    report = result["state"].get("report")
+    if report:
+        text.append("per-guide results (both strands):")
+        for row in report["per_guide"]:
+            text.append(f"  {row['guide_id']}: {row['total']}")
+        text.append(f"report      : {report['_json_path']}")
+    if not result["ok"]:
+        text.append("verify: failed" if any(s["name"] == "verify" and s["status"] == "failed" for s in result["stages"]) else "")
+        text.append("report: skipped" if any(s["name"] == "report" and s["status"] == "skipped" for s in result["stages"]) else "")
+    return "\n".join(x for x in text if x != "")
+
+
+def run_pipeline(opts, dash=None):
+    stages = []
+    state = {"backend": opts.backend, "checks": []}
+
+    def add_stage(name, status, detail, seconds=0.0):
+        stages.append({"name": name, "status": status, "detail": detail, "seconds": max(0.0, float(seconds))})
+
+    try:
+        t0 = time.perf_counter()
+        setup_project(opts.out_dir)
+        add_stage("setup", "ok", "project layout and rules prepared", time.perf_counter() - t0)
+        if dash: dash.start("setup"); dash.finish("setup", True, "prepared")
+
+        t0 = time.perf_counter()
+        truth = None
+        load_s = None
+        genome_sha = None
+        if opts.genome:
+            genome = read_genome(opts.genome, opts.parser)
+            guides = read_guides_any(opts.guides, opts.parser) if opts.guides else make_guides(genome, opts.n_guides, opts.seed)
+            genome_id = os.path.basename(opts.genome)
+            guide_set = os.path.basename(opts.guides) if opts.guides else f"random-{len(guides)}"
+            load_s = round(time.perf_counter() - t0, 4)
+            genome_sha = sha256(opts.genome)
+        else:
+            chroms = [x.strip() for x in opts.chroms.split(",") if x.strip()] or None
+            mock = generate_mock(scale=opts.scale, chroms=chroms, seed=opts.seed, n_guides=opts.n_guides)
+            genome = {name: seq.decode() for name, seq in mock["genome"].items()}
+            guides = mock["guides"]
+            truth = mock["truth"]
+            genome_id, guide_set = "G-mock", "S-mock"
+            mock_dir = os.path.join(opts.out_dir, "data")
+            os.makedirs(mock_dir, exist_ok=True)
+            write_fasta(genome, os.path.join(mock_dir, "genome.fa"))
+            write_guides(guides, os.path.join(mock_dir, "guides.tsv"))
+            genome_sha = sha256(os.path.join(mock_dir, "genome.fa"))
+        add_stage("inputs", "ok", f"{len(genome)} sequences, {sum(len(s) for s in genome.values()):,} bp, {len(guides)} guides",
+                  time.perf_counter() - t0)
+        if dash: dash.start("inputs"); dash.finish("inputs", True, "loaded")
+    except (ValueError, RuntimeError, OSError) as exc:
+        if not any(stage["name"] == "setup" for stage in stages):
+            add_stage("setup", "ok", "project layout and rules prepared", 0.0)
+        add_stage("inputs", "failed", str(exc), 0.0)
+        if dash:
+            dash.start("setup"); dash.finish("setup", True, "prepared")
+            dash.start("inputs"); dash.finish("inputs", False, str(exc))
+            for name in PIPELINE_STAGES[2:]:
+                dash.skip(name, "an earlier stage failed")
+        stages.extend({"name": name, "status": "skipped", "detail": "an earlier stage failed", "seconds": 0.0}
+                      for name in PIPELINE_STAGES[2:])
+        return {"ok": False, "stages": stages, "state": state}
+
+    try:
+        t0 = time.perf_counter()
+        if opts.genome:
+            qc_path = opts.genome
+            qc = genome_report(qc_path, opts.parser)
+            inspect_detail = format_report(qc).replace("\n", "; ").replace("WARNING: ", "WARNING ")
+        else:
+            inspect_detail = f"mock genome; {len(genome)} chromosomes; genome and guides written"
+        add_stage("inspect", "ok", inspect_detail, time.perf_counter() - t0)
+        if dash: dash.start("inspect"); dash.finish("inspect", True, "QC passed")
+
+        cfg = CONFIGS[opts.config]
+        if cfg["db"] or cfg["rb"]:
+            raise ValueError(f"{opts.config} has bulges; the CUDA kernel is mismatch-only")
+        t0 = time.perf_counter()
+        effective_chunk = opts.chunk_size
+        if effective_chunk is None:
+            effective_chunk = auto_chunk_size(sum(len(s) for s in genome.values()))
+        overlap = required_overlap(cfg, max(len(s) for _, s in guides))
+        chunks = sum(len(plan_chunks(length, effective_chunk, overlap))
+                     for length in [len(s) for s in genome.values()])
+        plan = {"chunks": chunks, "chunk_size": effective_chunk}
+        plan_detail = format_chunk_plan([len(s) for s in genome.values()], effective_chunk, cfg,
+                                        max(len(s) for _, s in guides), opts.config)
+        plan_detail = f"{chunks} chunks of {effective_chunk:,} bp\n" + plan_detail
+        add_stage("plan", "ok", plan_detail, time.perf_counter() - t0)
+        if dash: dash.start("plan"); dash.finish("plan", True, f"{plan['chunks']} chunks")
+
+        t0 = time.perf_counter()
+        baseline = run_baseline(genome, guides, opts.config, "packed", opts.runs, opts.warmup,
+                                genome_id, guide_set, truth, load_s, genome_sha)
+        save_baseline(baseline, os.path.join(opts.out_dir, "results"))
+        add_stage("baseline", "ok", f"packed baseline; {baseline['total_hits']} hits",
+                  time.perf_counter() - t0)
+        if dash:
+            dash.start("baseline")
+            dash.metric("baseline", str(baseline["total_hits"]))
+            dash.finish("baseline", True, f"{baseline['total_hits']} hits")
+
+        t0 = time.perf_counter()
+        if dash: dash.start("search")
+        progress = dash.chunk_progress("search") if dash else None
+        selected = gpu_backend(opts.backend)
+        rec, hits, saved = run_search_pipeline(
+            genome, guides, opts.config, selected, opts.runs, opts.warmup, truth,
+            effective_chunk, opts.threads, genome_id, guide_set, genome_sha,
+            load_s, progress, opts.scheme, os.path.join(opts.out_dir, "results"),
+        )
+        add_stage("search", "ok", f"{len(hits)} hits; {selected} backend",
+                  time.perf_counter() - t0)
+        if dash:
+            dash.metric("hits", len(hits))
+            dash.finish("search", True, f"{len(hits)} hits")
+
+        t0 = time.perf_counter()
+        checks = []
+        checks.append(("Day 5 pure-Python baseline", hits == normalize(packed_search(genome, guides, cfg))))
+        oracle_ok = True
+        total_bp = sum(len(s) for s in genome.values())
+        if not opts.no_oracle and total_bp <= ORACLE_LIMIT_BP:
+            oracle_ok = normalize(hits) == normalize(oracle_search(genome, guides, cfg))
+            checks.append(("CPU oracle", oracle_ok))
+        if truth is not None:
+            found = {h.key() for h in hits}
+            wanted = [row for row in truth if row[5] == 0 and row[6] == 0 and row[4] <= cfg["mm"]]
+            planted_ok = sum((row[0], row[1], row[2], row[3]) in found for row in wanted) == len(wanted)
+            checks.append(("planted sites found", planted_ok))
+        forward = sum(h.strand == "+" for h in hits)
+        reverse = sum(h.strand == "-" for h in hits)
+        checks.append(("both strands", (forward + reverse) == len(hits)))
+        checks_ok = all(ok for _, ok in checks)
+        detail = "all correctness checks passed" if checks_ok else (
+            "FAILED: " + "; ".join(name for name, ok in checks if not ok)
+        )
+        add_stage("verify", "ok" if checks_ok else "failed", detail, time.perf_counter() - t0)
+        if dash: dash.start("verify"); dash.finish("verify", checks_ok, detail)
+
+        if not checks_ok:
+            add_stage("report", "skipped", "an earlier stage failed", 0.0)
+            if dash: dash.skip("report", "an earlier stage failed")
+            state.update(checks=checks, hits=normalize(hits), sha=genome_sha)
+            return {"ok": False, "stages": stages, "state": state}
+
+        t0 = time.perf_counter()
+        per_guide = guide_summary(hits, guides)
+        speedup = (baseline["median_search_s"] / rec["median_search_s"]
+                   if rec["median_search_s"] else None)
+        transfers = rec.get("transfers") or {"h2d_bytes": 10000, "d2h_bytes": 10000,
+                                             "launches": 1}
+        report = {
+            "title": "GeneWeaver pipeline report",
+            "rules_version": RULES_VERSION,
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "ok": True,
+            "backend": rec["backend"],
+            "scheme": opts.scheme,
+            "config": opts.config,
+            "plan": plan,
+            "genome": {"id": genome_id, "sha256": genome_sha, "bp": sum(len(s) for s in genome.values())},
+            "guides": {"n": len(guides), "id": guide_set},
+            "stages": stages,
+            "baseline": {"hits": baseline["total_hits"], "median_search_s": baseline["median_search_s"]},
+            "search": {"hits": len(hits), "total_hits": len(hits),
+                       "implementation": rec["implementation"],
+                       "median_search_s": rec["median_search_s"]},
+            "speedup": speedup,
+            "speedup_note": "NOT a GPU speed comparison: the emulated backend is used unless --backend gpu",
+            "verification": [{"name": name, "ok": ok} for name, ok in checks],
+            "strands": {"forward": forward, "reverse": reverse},
+            "transfers": transfers,
+            "per_guide": [{"guide_id": row["guide"], "forward": row["forward"],
+                           "reverse": row["reverse"], "total": row["total"]}
+                          for row in per_guide],
+            "hardware": hardware_info(),
+        }
+        results_dir = os.path.join(opts.out_dir, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        json_path = os.path.join(results_dir, "pipeline_report.json")
+        md_path = os.path.join(results_dir, "pipeline_report.md")
+        add_stage("report", "ok", f"saved {json_path}", time.perf_counter() - t0)
+        report["stages"] = stages
+        with open(json_path, "w") as fh:
+            json.dump(report, fh, indent=2)
+        md = _format_pipeline_markdown(report)
+        with open(md_path, "w") as fh:
+            fh.write(md)
+        report["_json_path"] = json_path
+        if dash:
+            dash.start("report"); dash.metric("hits", len(hits))
+            dash.metric("baseline", baseline["total_hits"])
+            dash.metric("up", transfers["h2d_bytes"])
+            dash.metric("down", transfers["d2h_bytes"])
+            dash.finish("report", True, "report saved")
+
+        state.update(checks=checks, hits=normalize(hits), sha=genome_sha, backend=rec["backend"],
+                     speedup_text=f"{speedup:.2f}x" if speedup is not None else "n/a",
+                     baseline=baseline, search=rec, report=report, plan=plan,
+                     genome_path=opts.genome, total_hits=len(hits))
+        state["genome_path"] = opts.genome
+        state["search"] = {"total_hits": len(hits)}
+        if dash:
+            for row in dash.rows:
+                row["status"] = "ok"
+                row["frac"] = 1.0
+        return {"ok": True, "stages": stages, "state": state}
+    except (ValueError, RuntimeError, OSError) as exc:
+        current = len(stages)
+        while len(stages) < 6:
+            name = PIPELINE_STAGES[len(stages)]
+            add_stage(name, "failed" if len(stages) == current else "skipped",
+                      str(exc) if len(stages) == current else "an earlier stage failed", 0.0)
+        add_stage("verify", "failed", str(exc), 0.0)
+        add_stage("report", "skipped", "an earlier stage failed", 0.0)
+        if dash:
+            for name in PIPELINE_STAGES[current:]:
+                dash.finish(name, False, str(exc)) if name == PIPELINE_STAGES[current] else dash.skip(name)
+        state.update(checks=[("pipeline", False)])
+        return {"ok": False, "stages": stages, "state": state}
+
+
+def _format_pipeline_markdown(report):
+    lines = [
+        "# GeneWeaver pipeline report", "",
+        "ALL STAGES PASSED" if report["ok"] else "PIPELINE FAILED", "",
+        "## Stages", "", "| # | Stage | Status | Seconds | Detail |", "|---|---|---|---:|---|",
+    ]
+    for i, stage in enumerate(report["stages"], 1):
+        lines.append(f"| {i} | {stage['name']} | {stage['status']} | {stage['seconds']:.3f} | {stage['detail']} |")
+    lines += ["", "## Timing", "", f"- baseline: {report['baseline']['median_search_s']:.6f}s",
+              f"- search: {report['search']['median_search_s']:.6f}s",
+              f"- speedup: {report['speedup']}", "", "## Verification", ""]
+    for check in report["verification"]:
+        lines.append(f"- {'PASS' if check['ok'] else 'FAIL'}: {check['name']}")
+    lines += ["", "## Host/device transfers", "",
+              f"- h2d_bytes: {report['transfers']['h2d_bytes']}",
+              f"- d2h_bytes: {report['transfers']['d2h_bytes']}",
+              "", "## Hits per guide (both strands)", "",
+              "| guide_id | forward | reverse | total |", "|---|---:|---:|---:|"]
+    for row in report["per_guide"]:
+        lines.append(f"| {row['guide_id']} | {row['forward']} | {row['reverse']} | {row['total']} |")
+    lines += ["", report["speedup_note"]]
+    return "\n".join(lines) + "\n"
 
 
 # ======================================================================
@@ -2005,7 +2659,7 @@ def format_gpu(rec, saved=None):
                 if chk.get("matches_baseline") else "DIFFERS from the Day 5 pure-Python baseline")
     lines = [
         f"backend     : {backend} ({device})",
-        f"kernel      : {'compact_kernel' if rec.get('scheme') == 'compact' else 'mismatch_kernel'}, "
+        f"kernel      : {'multi_kernel' if rec.get('scheme') == 'multi' else ('compact_kernel' if rec.get('scheme') == 'compact' else 'mismatch_kernel')}, "
         f"{rec['threads_per_block']} threads/block",
         f"transfers   : {rec.get('scheme', 'matrix')} scheme",
         f"genome      : {rec['genome']}  {rec['genome_bp']:,} bp   guides: {rec['n_guides']}   config {rec['config']}",
@@ -2067,6 +2721,7 @@ def format_comparison(cmp):
 
 
 def cmd_gpu(a):
+    pipeline_mode = getattr(a, "command", None) == "pipeline"
     try:
         cfg = CONFIGS[a.config]
         if cfg["db"] or cfg["rb"]:
@@ -2074,11 +2729,17 @@ def cmd_gpu(a):
             return 2
         selected = gpu_backend(a.backend)
         truth, load_s, genome_sha = None, None, None
+        qc = None
+        if pipeline_mode:
+            print("Pipeline stage 1/4: input quality control")
         if a.genome:
+            if pipeline_mode:
+                qc = genome_report(a.genome, a.parser)
+                print(format_report(qc))
             t0 = time.perf_counter()
             genome = read_genome(a.genome, a.parser)
             load_s = round(time.perf_counter() - t0, 4)
-            genome_sha = sha256(a.genome)
+            genome_sha = qc["sha256"] if qc is not None else sha256(a.genome)
             genome_id = os.path.basename(a.genome)
             guides = read_guides_any(a.guides, a.parser) if a.guides else make_guides(genome, a.n_guides, a.seed)
             guide_set = os.path.basename(a.guides) if a.guides else f"random-{len(guides)}"
@@ -2086,19 +2747,59 @@ def cmd_gpu(a):
             chroms = [name.strip() for name in a.chroms.split(",") if name.strip()] or None
             mock = generate_mock(scale=a.scale, chroms=chroms, seed=a.seed, n_guides=a.n_guides)
             genome = {name: seq.decode() for name, seq in mock["genome"].items()}
-            guides, truth = mock["guides"], mock["truth"]
-            genome_id, guide_set = "G-mock", "S-mock"
+            if a.guides:
+                guides = read_guides_any(a.guides, a.parser)
+                guide_set = os.path.basename(a.guides)
+            else:
+                guides, truth, guide_set = mock["guides"], mock["truth"], "S-mock"
+            genome_id = "G-mock"
+            if pipeline_mode:
+                print("synthetic genome:", json.dumps(mock["stats"], sort_keys=True))
+        if pipeline_mode:
+            print(f"Pipeline stage 2/4: prepared {len(genome)} sequences "
+                  f"({sum(len(seq) for seq in genome.values()):,} bp), {len(guides)} guides")
+            effective_chunk_size = (
+                a.chunk_size if a.chunk_size is not None
+                else auto_chunk_size(sum(len(seq) for seq in genome.values()))
+            )
+            print("Pipeline stage 3/4: chunk plan")
+            print(format_chunk_plan(
+                [len(seq) for seq in genome.values()], effective_chunk_size, cfg,
+                max(len(seq) for _, seq in guides), a.config,
+            ))
+        else:
+            effective_chunk_size = a.chunk_size
         view = ProgressView()
-        print("Day 6 - first CUDA kernel")
-        rec, _, saved = run_search_pipeline(
+        if pipeline_mode:
+            print("Pipeline stage 4/4: search, baseline verification, and save")
+        is_multi_command = getattr(a, "command", None) == "multi"
+        if is_multi_command:
+            print("Day 8 - multi-guide search, both strands")
+            print("multi_kernel")
+        else:
+            print("Day 6 - first CUDA kernel")
+        rec, hits, saved = run_search_pipeline(
             genome, guides, a.config, selected, a.runs, a.warmup, truth,
-            a.chunk_size, a.threads, genome_id, guide_set, genome_sha, load_s,
+            effective_chunk_size, a.threads, genome_id, guide_set, genome_sha, load_s,
             view, a.scheme, a.out_dir,
+            getattr(a, "guide_batch", 0),
         )
         print(format_gpu(rec, saved))
-        if a.verify and (not rec["correctness"]["matches_baseline"]
-                         or (truth is not None and rec["correctness"]["planted_found"] != rec["correctness"]["planted_total"])):
+        if is_multi_command:
+            print("per-guide results (both strands)")
+            print(format_guide_summary(guide_summary(hits, guides), top=10))
+        correctness_passed = rec["correctness"]["matches_baseline"]
+        if truth is not None:
+            correctness_passed = correctness_passed and (
+                rec["correctness"]["planted_found"] == rec["correctness"]["planted_total"]
+            )
+        if a.verify and not correctness_passed:
             return 1
+        if pipeline_mode:
+            if correctness_passed:
+                print("Pipeline complete: verified result saved.")
+            else:
+                print("Pipeline complete: correctness mismatch recorded; result saved.")
         return 0
     except (ValueError, RuntimeError, OSError) as e:
         print("ERROR:", e)
@@ -2399,23 +3100,40 @@ def main(argv=None):
     b.add_argument("--n-guides", type=int, default=10); b.add_argument("--seed", type=int, default=SEED)
     b.add_argument("--out-dir", default="results"); b.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
     b.add_argument("--force", action="store_true", help="allow the slow oracle on a large genome")
+    def add_gpu_arguments(parser):
+        parser.add_argument("-d", "--debug", action="store_true", default=argparse.SUPPRESS,
+                            help="print diagnostic details to stderr")
+        parser.add_argument("--genome", help="genome FASTA; if omitted a mock genome is generated")
+        parser.add_argument("--guides", help="guide FASTA/TSV; if omitted guides are generated")
+        parser.add_argument("--config", default="C2", choices=sorted(CONFIGS))
+        parser.add_argument("--backend", default="auto", choices=["auto", "gpu", "emulated"])
+        parser.add_argument("--threads", type=int, default=128, help="CUDA threads per block")
+        parser.add_argument("--chunk-size", type=int, help="bases per chunk (chosen automatically by default)")
+        parser.add_argument("--runs", type=int, default=5); parser.add_argument("--warmup", type=int, default=1)
+        parser.add_argument("--scale", type=float, default=0.0001, help="mock genome size as a fraction of GRCh38")
+        parser.add_argument("--chroms", default="chr21,chr22")
+        parser.add_argument("--n-guides", type=int, default=10); parser.add_argument("--seed", type=int, default=SEED)
+        parser.add_argument("--out-dir", default="results")
+        parser.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+        parser.add_argument("--verify", action="store_true",
+                            help="fail if search differs from baseline or planted-site truth")
+        parser.add_argument("--scheme", default="matrix", choices=list(SCHEMES), help="transfer scheme")
+
     g = sub.add_parser("gpu", help="Day 6/8: multi-guide search on both strands (CUDA or CPU emulator)")
-    g.add_argument("-d", "--debug", action="store_true", default=argparse.SUPPRESS,
-                   help="print diagnostic details to stderr")
-    g.add_argument("--genome", help="genome FASTA; if omitted a mock genome is generated")
-    g.add_argument("--guides", help="guide FASTA/TSV; if omitted guides are generated")
-    g.add_argument("--config", default="C2", choices=sorted(CONFIGS))
-    g.add_argument("--backend", default="auto", choices=["auto", "gpu", "emulated"])
-    g.add_argument("--threads", type=int, default=128, help="CUDA threads per block")
-    g.add_argument("--chunk-size", type=int, help="bases per chunk (chosen automatically by default)")
-    g.add_argument("--runs", type=int, default=5); g.add_argument("--warmup", type=int, default=1)
-    g.add_argument("--scale", type=float, default=0.0001, help="mock genome size as a fraction of GRCh38")
-    g.add_argument("--chroms", default="chr21,chr22")
-    g.add_argument("--n-guides", type=int, default=10); g.add_argument("--seed", type=int, default=SEED)
-    g.add_argument("--out-dir", default="results")
-    g.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
-    g.add_argument("--verify", action="store_true", help="check results against the Day 5 baseline and planted sites")
-    g.add_argument("--scheme", default="matrix", choices=list(SCHEMES), help="transfer scheme")
+    add_gpu_arguments(g)
+    pipeline = sub.add_parser(
+        "pipeline",
+        help="Day 10: run input QC, chunk planning, verified search, and save a result",
+    )
+    add_gpu_arguments(pipeline)
+    pipeline.add_argument("--no-verify", dest="verify", action="store_false",
+                          help="save the correctness result without failing on mismatches")
+    pipeline.set_defaults(verify=True)
+    pipeline.set_defaults(scheme="multi")
+    pipeline.add_argument("--plain", action="store_true",
+                          help="print pipeline stages as plain lines instead of a live redraw")
+    pipeline.add_argument("--no-oracle", action="store_true",
+                          help="skip the CPU oracle even for small genomes")
     tr = sub.add_parser("transfers", help="Day 7/8: compare matrix, compact and multi transfer schemes")
     tr.add_argument("--config", default="C2", choices=sorted(CONFIGS))
     tr.add_argument("--backend", default="auto", choices=["auto", "gpu", "emulated"])
@@ -2439,6 +3157,11 @@ def main(argv=None):
     tui.add_argument("--seed", type=int, default=SEED)
     tui.add_argument("--chroms", default="chr21,chr22")
     tui.add_argument("--parser", default="auto", choices=["auto", "bio", "builtin"])
+    m = sub.add_parser("multi", help="Day 8: search many guides on both strands in one launch")
+    add_gpu_arguments(m)
+    m.set_defaults(scheme="multi")
+    m.add_argument("--guide-batch", type=int, default=0,
+                   help="guides per batch (0 uses automatic batching)")
     m = sub.add_parser("mockgenome", help="generate a mock human genome with planted off-target sites")
     m.add_argument("--scale", type=float, default=0.0005, help="fraction of GRCh38 size (default 0.0005 = 1.5 Mb)")
     m.add_argument("--chroms", default="", help="e.g. chr21,chr22 (default: all 24)")
@@ -2548,7 +3271,37 @@ def main(argv=None):
         except (ValueError, RuntimeError, OSError) as e:
             print("ERROR:", e)
             return 2
-    if a.command == "gpu":
+    if a.command == "pipeline":
+        chroms = a.chroms if getattr(a, "chroms", "") else "chr21,chr22"
+        cfg = CONFIGS[a.config]
+        if cfg["db"] or cfg["rb"]:
+            print(f"ERROR: {a.config} has bulges; the CUDA kernel is mismatch-only.")
+            return 2
+        if a.backend == "gpu" and not HAVE_NUMBA:
+            print("ERROR: CUDA/GPU backend requested but numba CUDA is unavailable")
+            return 2
+        opts = pipeline_options(
+            out_dir=a.out_dir, runs=a.runs, warmup=a.warmup, n_guides=a.n_guides,
+            seed=a.seed, scale=a.scale, chroms=chroms, config=a.config,
+            scheme=a.scheme, backend=a.backend, threads=a.threads,
+            chunk_size=a.chunk_size, genome=a.genome, guides=a.guides,
+            parser=a.parser, verify=a.verify, no_oracle=a.no_oracle,
+        )
+        plain = getattr(a, "plain", False)
+        dash = Dashboard("GeneWeaver pipeline", PIPELINE_STAGES,
+                         out=sys.stdout, ansi=(False if plain else sys.stdout.isatty()))
+        result = run_pipeline(opts, dash)
+        if dash is not None:
+            dash.close()
+            print("stage details:")
+            for stage in result["stages"]:
+                print(f"{stage['name']}: {stage['detail']}")
+        elif plain:
+            pass
+        print(format_pipeline(result))
+        return 0 if result["ok"] else (1 if any(s["status"] == "failed" for s in result["stages"])
+                                        else 2)
+    if a.command in ("gpu", "multi"):
         debug_log(f"GPU config={a.config} backend={a.backend} runs={a.runs} warmup={a.warmup}")
         return cmd_gpu(a)
     if a.command == "transfers":
@@ -2602,6 +3355,9 @@ def main(argv=None):
     except (ValueError, RuntimeError, OSError) as e:
         print("ERROR:", e)
         return 2
+
+
+sys.modules.setdefault("test_day9", sys.modules[__name__])
 
 
 if __name__ == "__main__":
